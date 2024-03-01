@@ -65,7 +65,8 @@ def getListFromSAM(samQuery):
 
 def getListFromMetaCat(mql):
   try:
-    outcome = subprocess.run('metacat query --json --metadata all "%s" ' % mql,
+    cmd = 'metacat query --json --with-provenance --metadata all "%s"' % mql
+    outcome = subprocess.run(cmd,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT,
                              shell=True,
@@ -81,6 +82,10 @@ def getListFromMetaCat(mql):
 def makeMetadataForSAM(metaCatFile):
 
   samMetadata = copy.deepcopy(metaCatFile['metadata'])
+  print(metaCatFile)
+  if 'parents' in metaCatFile:
+    print('Found parents in top level -- will add it to metadata')
+    samMetadata['parents'] = metaCatFile['parents']
 
   # From pdjson2metadata
   coreAttributes = {
@@ -118,10 +123,20 @@ def makeMetadataForSAM(metaCatFile):
   # Try patching parents
   if 'parents' in samMetadata:
     for parent in samMetadata['parents']:
-     # Remove fardet-hd/vd preamble if needed
-      parent['file_name'] = (parent['file_name'].replace('fardet-hd:', '').
-          replace('fardet-vd:', ''))
-      print('Patched parent', parent)
+      if 'file_name' in parent:
+        # Remove fardet-hd/vd preamble if needed
+        parent['file_name'] = (parent['file_name'].replace('fardet-hd:', '').
+            replace('fardet-vd:', ''))
+        print('Patched parent', parent)
+      elif 'fid' in parent:
+        outcome = subprocess.run('metacat file show -j -i ' + parent['fid'],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT,
+                                 shell=True,
+                                 encoding='utf-8' 
+                                )
+        parent_json = json.loads(outcome.stdout)
+        parent['file_name'] = parent_json['name']
 
   try:
     samMetadata['application'] = { 
