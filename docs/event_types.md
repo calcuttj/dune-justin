@@ -1,6 +1,6 @@
 # Event types
 
-These event types are used by justIN to record state transitions
+These event types are used within justIN to record state transitions
 and can be viewed in the [Dashboard](dashboard.md). They are especially useful
 for cross
 referencing workflows, files, jobs, sites and storages, as the identity of
@@ -9,19 +9,23 @@ in the Dashboard.
 
 |Number|Name|Description|
 |------|----|-----------|
-|0|UNDEFINED|Undefined|
-|100|HEARTBEAT_RECEIVED|Heartbeat received by allocator|
-|101|GET_STAGE_RECEIVED|get_stage received from job by allocator|
-|102|STAGE_ALLOCATED|Stage allocated to job|
-|103|FILE_ALLOCATED|File allocated to job|
-|104|OUTPUTTING_RECEIVED|Outputting state received from job by allocator|
-|105|CONFIRM_RECEIVED|Confirmation received from job by allocator|
-|201|FILE_ADDED|File added to first stage by finder|
-|202|REPLICA_ADDED|Replica added for file by finder|
-|203|REPLICA_STAGING_WORKFLOWED|Finder workflows replica staging|
-|204|REPLICA_STAGING_DONE|Replica staging workflowed by finder done|
-|205|REPLICA_STAGING_CANCELLED|Replica staging cancelled by finder|
-|206|WORKFLOW_FINISHED|Finder identifies workflow as finished|
+|101|WORKFLOW_CREATED|Workflow created|
+|102|STAGE_CREATED|Stage created|
+|103|WORKFLOW_SUBMITTED|Workflow has been submitted|
+|104|WORKFLOW_PAUSED|Workflow has been paused|
+|105|WORKFLOW_RESTARTED|Workflow has been restarted|
+|105|WORKFLOW_FINISHED_BY_USER|Workflow marked finished by user |
+|106|WORKFLOW_PAUSED_NOTUSED|Workflow paused, too many Notused jobs|
+|107|WORKFLOW_PAUSED_NONE_PROCESSED|Workflow paused, too many None Processed jobs|
+|108|WORKFLOW_PAUSED_JOBSCRIPT_ERROR|Workflow paused, too many jobscript errors|
+|109|WORKFLOW_FAILED_TOO_MANY_FILES|Workflow failed, too many input files|
+|201|FILE_ADDED|File added to first stage by Finder|
+|202|REPLICA_ADDED|Replica added for file by Finder|
+|203|REPLICA_STAGING_REQUESTED|Finder requests replica staging|
+|204|REPLICA_STAGING_DONE|Replica staging requested by Finder is done|
+|205|REPLICA_STAGING_CANCELLED |Replica staging cancelled by Finder|
+|206|WORKFLOW_STARTED_BY_FINDER|Finder starts the workflow running|
+|207|WORKFLOW_FINISHED_BY_FINDER|Workflow marked finished by Finder|
 |301|JOB_SUBMITTED|Job submitted by factory|
 |302|JOB_STARTED|Job started running at site|
 |303|JOB_PROCESSING|Job began processing files|
@@ -29,12 +33,44 @@ in the Dashboard.
 |305|JOB_FINISHED|Job finished|
 |306|JOB_NOTUSED|Job was not allocated a stage|
 |307|JOB_ABORTED|Job aborted|
-|308|JOB_STALLED|Job identified as stalled by Finder|
+|308|JOB_STALLED_HEARTBEAT|Job stalls with missing heartbeats|
 |309|JOB_SCRIPT_ERROR|Error raised by the jobscript|
+|310|JOB_OUTPUTTING_FAILED|Job outputting failed|
+|311|JOB_STALLED_HTCONDOR|Job stalls as absent from HTCondor|
+|312|JOB_ABORT_RECORDING_RESULT|Job aborted when recording results|
+|313|JOB_ABORT_CREATING_LOGS_TGZ|Job aborted when creating logs.tgz|
+|314|JOB_ABORT_METACAT_LOGS_CREATION|Job aborted when creating logs.tgz JSON|
+|315|JOB_ABORT_METACAT_LOGS_REGISTRATION|Job aborted when registering logs.tgz|
+|316|JOB_ABORT_RUCIO_UPLOAD_LOGS|Job aborted when uploading logs.tgz|
+|317|JOB_ABORT_WEBDAV_UPLOAD|Job aborted during WebDAV upload|
+|318|JOB_ABORT_CREATING_METADATA|Job aborted creating metadata json|
+|319|JOB_ABORT_METACAT_REGISTRATION|Job aborted during file MetaCat registration|
+|320|JOB_ABORT_RUCIO_UPLOAD_FILE|Job aborted during file Rucio upload|
+|321|JOB_ABORT_METACAT_UPLOADED|Job aborted during MetaCat set uploaded|
+|322|JOB_ABORT_METACAT_CONFIRMED|Job aborted during MetaCat set confirmed|
+|323|JOB_ABORT_CVMFS_CHECKS|Job aborted during cvmfs checks|
+|324|JOB_ABORT_SCRIPT_ERROR|Job aborted due to jobscript error|
+|325|JOB_NONE_PROCESSED|Job asked for no files or processed none of those allocated|
+|326|JOB_HTCONDOR_LOGS_CACHED|Logs from HTCondor cached for this job|
+|327|JOB_REMOVED_FROM_HTCONDOR|Job removed from HTCondor spool|
+|328|JOB_ABORT_RUCIO_SILENT_FAILURE|Job aborted due to silent Rucio upload failure|
+|401|FILE_ALLOCATED|File allocated to job|
 |402|FILE_ALLOCATED_RESET|File set back to unallocated from allocated|
 |403|FILE_SET_TO_FAILED|Too many attempts to process file: failed|
 |404|FILE_CREATED|Output file created in job|
 |405|FILE_OUTPUTTING_RESET|File set back to unallocated from outputting|
+|406|FILE_UPLOADED|Output file uploaded in job|
+|407|FILE_PROCESSED|Input file processed by jobscript|
+|501|AWT_READ_OK|AWT read test succeeds|
+|502|AWT_READ_FAIL|AWT read test fails|
+|503|AWT_WRITE_OK|AWT write test succeeds|
+|504|AWT_WRITE_FAIL|AWT write test fails|
+|601|SITE_ENABLED|Site is marked as enabled for jobs|
+|602|SITE_DISABLED|Site is marked as disabled for jobs|
+|603|STORAGE_READ_ENABLED|RSE is marked as enabled for reading|
+|604|STORAGE_READ_DISABLED|RSE is marked as disabled for reading|
+|605|STORAGE_WRITE_ENABLED|RSE is marked as enabled for writing|
+|606|STORAGE_WRITE_DISABLED|RSE is marked as disabled for writing|
 
 
-This file is automatically generated from the code in the justin.db module. 
+This file is automatically generated from the code in the justin package. 

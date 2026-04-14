@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 : <<'EOF'
 
 Hello World jobscript for justIN
@@ -15,11 +15,13 @@ justin simple-workflow \
      --jobscript hello-world.jobscript \
      --description 'Hello World!!!' \
      --scope usertests \
-     --output-pattern 'hello-world-*.txt:output-test-01'
+     --output-pattern 'hello-world-*.txt:output-test-01' \
+     --lifetime-days 1
 
 EOF
 
 # Try to get an unprocessed file from this stage
+# The justin-get-file command must ALWAYS be present, even for MC workflows
 did_pfn_rse=`$JUSTIN_PATH/justin-get-file`
 
 if [ "$did_pfn_rse" != "" ] ; then
@@ -27,11 +29,14 @@ if [ "$did_pfn_rse" != "" ] ; then
   pfn=`echo $did_pfn_rse | cut -f2 -d' '`
   rse=`echo $did_pfn_rse | cut -f3 -d' '`
 
-  # We say we processed whatever we were given
-  echo "$pfn" > justin-processed-pfns.txt
-
-  # Hello world
-  echo "Hello world $pfn" 
+  # Hello world to a txt file
   echo "Hello world $pfn" >hello-world-`date +%s.%N.txt`
+
+  # Hello world to the jobscript log 
+  echo "Hello world $pfn" 
+  if [ $? = 0 ] ; then
+    # If echo returns 0, then say we processed the file successfully
+    echo "$pfn" > justin-processed-pfns.txt
+  fi
 fi
 exit 0

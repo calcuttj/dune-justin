@@ -1,7 +1,7 @@
 #
 # justin-wsgi-allocator - justIN allocator API service
 #
-# Copyright 2013-24, Andrew McNab for the University of Manchester
+# Copyright 2013-25, Andrew McNab for the University of Manchester
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -32,7 +32,12 @@ import random
 import string
 import urllib
 import hashlib
-import M2Crypto
+
+#import M2Crypto
+
+# After 0.39.0, M2Crypto needs "from M2Crypto import" syntax 
+from M2Crypto import RSA,BIO,X509,ASN1,EVP
+
 #import htcondor
 
 import justin
@@ -56,17 +61,15 @@ def httpError(startResponse, code, message):
 
   return [message.encode('UTF-8')]
 
-def httpOK(startResponse, outputString):
+def httpOK(startResponse, outputString, codeStr = '200 OK'):
 
   try:
     justin.conn.commit()
   except Exception as e:
-    code = '500 Internal Server Error'
+    codeStr = '500 Internal Server Error'
     outputString = 'Database commit fails: ' + str(e)
-  else:
-    code = '200 OK'
 
-  startResponse(code,
+  startResponse(codeStr,
                 [('Content-type',   'text/plain'),
                  ('Content-length', str(len(outputString)))
                 ])
@@ -104,21 +107,38 @@ def updateSitesRankCache(siteName):
         'LEFT JOIN replicas ON replicas.file_id=files.file_id '
         'LEFT JOIN sites_storages ON sites_storages.rse_id=replicas.rse_id '
         'AND sites_storages.site_id=%d '
+        'LEFT JOIN stages_input_storages '
+        'ON stages_input_storages.workflow_id=files.workflow_id '
+        'AND stages_input_storages.stage_id=files.stage_id '
+        'AND stages_input_storages.rse_id=replicas.rse_id '
+        'LEFT JOIN storages ON storages.rse_id=replicas.rse_id '
         'WHERE files.state="unallocated" '
         'AND files.workflow_id=stages.workflow_id '
         'AND files.stage_id=stages.stage_id '
+        'AND stages_input_storages.rse_id IS NOT NULL '
         'AND sites_storages.distance IS NOT NULL '
         'AND sites_storages.distance <= stages.max_distance '
+        'AND storages.rucio_read AND storages.justin_read '
         'ORDER BY sites_storages.distance '
         'LIMIT 10) AS avg_distance '
       'FROM workflows '
       'LEFT JOIN stages ON stages.workflow_id=workflows.workflow_id '
+      'LEFT JOIN stages_sites '
+      'ON stages_sites.workflow_id=stages.workflow_id '
+      'AND stages_sites.stage_id=stages.stage_id '
+      'AND stages_sites.site_id=%d '
+      'LEFT JOIN scopes ON scopes.scope_id=workflows.scope_id '
+      'LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id '
       'WHERE workflows.workflow_id<>%d '
       'AND workflows.state="running" '
       'AND stages.stage_priority IS NOT NULL '
+      'AND stages_sites.site_id IS NOT NULL '
+      'AND named_quotas.running_jobs < named_quotas.max_running_jobs '
+      'AND named_quotas.processing_enabled '
+# WE SHOULD CHECK processing_enabled FOR THE SUBMITTER OF THE WORKFLOW TOO!
       'ORDER BY avg_distance,stages.stage_priority DESC,'
       'workflows.workflow_id LIMIT 100'
-      % (siteRow['site_id'], justin.awtWorkflowID))
+      % (siteRow['site_id'], siteRow['site_id'], justin.awtWorkflowID))
 
     print('updateSitesRankCache() query: ' + query, file=sys.stderr)
     stages = justin.select(query)
@@ -160,31 +180,71 @@ def getClassadsCall(startResponse, environ):
                      '400 Bad Request', 'Failed to get inputString: ' + str(e))
 
   try:
+    i = inputString.index('GLIDEIN_UUID ')
+    glideinUUID = inputString[i+13:].split('\n')[0]
+
+    if not justin.stringNoQuotes(glideinUUID):
+      raise RuntimeError('Quotes in UUID')
+  except Exception as e:
+    return httpError(startResponse, 
+                     '400 Bad Request', 'Failed to get UUID: ' + str(e))
+
+  try:
     i = inputString.index('GLIDEIN_DUNESite ')
     siteName = inputString[i+17:].split('\n')[0]
+
+    if not justin.stringNoQuotes(siteName):
+      raise RuntimeError('Quotes in siteName')
   except Exception as e:
     return httpError(startResponse, 
                      '400 Bad Request', 'Failed to get siteName: ' + str(e))
 
-  if not justin.stringNoQuotes(siteName):
-    raise RuntimeError('Quotes in siteName')
-
   try:
-    # This is only used to create a ClassAd, not in the caching
-    i = inputString.rindex('HAS_INNER_APPTAINER=')
-    hasInnerApptainer = bool(inputString[i+20:].split('\n')[0])
+    i = inputString.index('GLIDEIN_Entry_Name ')
+    entryName = inputString[i+19:].split('\n')[0]
+
+    if not justin.stringNoQuotes(entryName):
+      raise RuntimeError('Quotes in entryName')
   except Exception as e:
     return httpError(startResponse, 
-               '400 Bad Request', 'Failed to get hasInnerApptainer: ' + str(e))
+                     '400 Bad Request', 'Failed to get entryName: ' + str(e))
 
   try:
+    i = inputString.index('HOSTNAME=')
+    pilotHostname = inputString[i+9:].split('\n')[0]
+
+    if not justin.stringNoQuotes(pilotHostname):
+      raise RuntimeError('Quotes in pilotHostname')
+  except Exception as e:
+    pilotHostname=''
+#    return httpError(startResponse, 
+#                     '400 Bad Request', 'Failed to get Hostname: ' + str(e))
+
+  try:
+    siteEntryRow = justin.select('SELECT '
+         '(SELECT site_id FROM sites WHERE site_name="%s") AS site_id,'
+         '(SELECT entry_id FROM entries WHERE entry_name="%s") AS entry_id'
+         % (siteName, entryName), justOne = True)
+
+    siteID  = int(siteEntryRow['site_id'])
+    entryID = int(siteEntryRow['entry_id'])
+  except Exception as e:
+    return httpError(startResponse, '404 Not Found', 'Not Found: ' + str(e))
+
+  try:
+    justin.insertUpdate('INSERT INTO pilot_events SET '
+                        'glidein_uuid="%s",entry_id=%d,hostname="%s",'
+                        'event_time=NOW()'
+                        % (glideinUUID, entryID, pilotHostname))
+  except:
+    pass
+    
+  try:
     row = justin.select('SELECT rank_text,'
-                        'TIMESTAMPDIFF(SECOND, cache_time, NOW()) AS seconds,'
-                        'sites.site_id FROM sites '
-                        'LEFT JOIN sites_ranks_cache '
-                        'ON sites_ranks_cache.site_id=sites.site_id '
-                        'WHERE sites.site_name="%s" AND cache_time IS NOT NULL'
-                        % siteName, justOne = True)
+                        'TIMESTAMPDIFF(SECOND, cache_time, NOW()) AS seconds '
+                        'FROM sites_ranks_cache '
+                        'WHERE site_id=%d AND cache_time IS NOT NULL'
+                        % siteID, justOne = True)
   except Exception as e:
     return httpError(startResponse, '404 Not Found', 'Not Found: ' + str(e))
 
@@ -204,17 +264,18 @@ def getClassadsCall(startResponse, environ):
       rankText = updateSitesRankCache(siteName)
       releaseCacheLock('justin_allocator_ranks_cache')
 
-  if justin.proDev == 'dev':
-    justinRank = ('isUndefined(Target.JUSTIN_DEV_Stage)'
-                    '?My.JUSTIN_PRO_Rank:My.JUSTIN_DEV_Rank')
-  else:
-    justinRank = 'My.JUSTIN_PRO_Rank'
+  # This needs to be the same from all instances as justin-get-classads.sh
+  # run inside the GlideIn queries all allocator instances and takes 
+  # the Rank expression from the LAST one
+  justinRank = ('isUndefined(My.JUSTIN_FNAL_Rank)?0:My.JUSTIN_FNAL_Rank + '
+                'isUndefined(My.JUSTIN_RAL_Rank )?0:My.JUSTIN_RAL_Rank  + '
+                'isUndefined(My.JUSTIN_DEV_Rank )?0:My.JUSTIN_DEV_Rank  + '
+                'isUndefined(My.JUSTIN_INT_Rank )?0:My.JUSTIN_INT_Rank')
 
-   # Return ClassAds to be published by the pilot/glidein
-  # Non-justIN jobs get rank 0 or 101
+  # Return ClassAds to be published by the pilot/glidein
   # If a justIN job has a stage not listed in the rankText dictionary
   # then it gets rank Undefined which equals 0
-  proDevUpper = justin.proDev.upper()
+  instanceUpper = justin.instance.upper()
   return httpOK(startResponse, 
            "JUSTIN_%s_ClassAds_Time %d\n"
            "JUSTIN_%s_Stage_Ranks_Raw %s\n"
@@ -222,17 +283,14 @@ def getClassadsCall(startResponse, environ):
              "isUndefined(My.GLIDEIN_PS_JUSTIN_%s_Stage_Ranks_Raw)"
              "?My.JUSTIN_%s_Stage_Ranks_Raw"
              ":My.GLIDEIN_PS_JUSTIN_%s_Stage_Ranks_Raw\n"
-           "JUSTIN_%s_Has_Inner_Apptainer %s\n"
            "JUSTIN_%s_Rank isUndefined(Target.JUSTIN_%s_Stage)"
-             "?%d:My.JUSTIN_%s_Stage_Ranks[Target.JUSTIN_%s_Stage]\n"
+             "?0:My.JUSTIN_%s_Stage_Ranks[Target.JUSTIN_%s_Stage]\n"
            "Rank %s\n"
-              % (proDevUpper, int(time.time()),
-                 proDevUpper, rankText,
-                 proDevUpper, proDevUpper, proDevUpper, proDevUpper,
-                 proDevUpper, hasInnerApptainer,
-                 proDevUpper, proDevUpper, 
-                   101 if (random.random() < justin.nonJustinFraction) else 0,
-                   proDevUpper, proDevUpper,
+              % (instanceUpper, int(time.time()),
+                 instanceUpper, rankText,
+                 instanceUpper, instanceUpper, instanceUpper, instanceUpper,
+                 instanceUpper, instanceUpper, 
+                   instanceUpper, instanceUpper,
                  justinRank)
                 )
 
@@ -245,6 +303,8 @@ def makeJobDict(jsonDict, jobscriptSecret = None):
              'jobs.job_state,'
              'jobs.jobscript_secret,'
              'stages.max_distance,'
+             'workflows.mql,'
+             'workflows.state,'
              'jobs.workflow_id,'
              'jobs.stage_id,'
              'jobs.justin_job_id,'
@@ -253,6 +313,8 @@ def makeJobDict(jsonDict, jobscriptSecret = None):
              'jobs.requested_rss_bytes,'
              'jobs.requested_wall_seconds,'
              'jobs.has_inner_apptainer,'
+             'jobs.jobscript_exit,'
+             'jobs.allocated_files,'
              'sites.site_name,'
              'sites.running_jobs,'
              'sites.enabled,'
@@ -261,16 +323,28 @@ def makeJobDict(jsonDict, jobscriptSecret = None):
              'entries.entry_name,'
              'entries.entry_id,'
              'scopes.scope_name,'
-             'wlcg_groups.wlcg_group_name '
+             'wlcg_groups.wlcg_group_name,'
+             'named_quotas.processing_enabled AS quota_processing_enabled,'
+             'users.processing_enabled AS user_processing_enabled,'
+             'stages_sites.site_id AS s_s_site_id,'
+             '(SELECT key_value FROM keys_names_values '
+             ' WHERE key_name="ping_rucio_milliseconds") '
+             ' AS ping_rucio_milliseconds ' 
              'FROM jobs '
              'LEFT JOIN stages ON jobs.workflow_id=stages.workflow_id '
              'AND jobs.stage_id=stages.stage_id '
              'LEFT JOIN sites ON jobs.site_id=sites.site_id '
+             'LEFT JOIN stages_sites '
+             'ON stages_sites.workflow_id=jobs.workflow_id '
+             'AND stages_sites.stage_id=jobs.stage_id '
+             'AND stages_sites.site_id=jobs.site_id '
              'LEFT JOIN entries ON jobs.entry_id=entries.entry_id '
              'LEFT JOIN workflows ON workflows.workflow_id=jobs.workflow_id '
              'LEFT JOIN scopes ON scopes.scope_id=workflows.scope_id '
+             'LEFT JOIN named_quotas ON scopes.quota_id=named_quotas.quota_id '
              'LEFT JOIN wlcg_groups '
-             'ON wlcg_groups.wlcg_group_id=scopes.wlcg_group_id '
+             'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+             'LEFT JOIN users ON users.user_id=workflows.user_id '
              'WHERE jobs.jobsub_id="%s"'
              % jsonDict['jobsub_id'])
 
@@ -290,6 +364,7 @@ def makeJobDict(jsonDict, jobscriptSecret = None):
   return { "error_message"          : None,
            "workflow_id"            : job['workflow_id'],
            "stage_id"               : job['stage_id'],
+           "workflow_state"         : job['state'],
            "site_id"                : job['site_id'],
            "site_name"              : job['site_name'],
            "site_a_i_a"             : job['site_a_i_a'],
@@ -302,14 +377,20 @@ def makeJobDict(jsonDict, jobscriptSecret = None):
            "job_state"              : job['job_state'],
            "jobscript_secret"       : job['jobscript_secret'],
            "max_distance"           : job['max_distance'],
+           "mql"                    : job['mql'],
            "requested_processors"   : job['requested_processors'],
            "requested_rss_bytes"    : job['requested_rss_bytes'],
            "requested_wall_seconds" : job['requested_wall_seconds'],
            "has_inner_apptainer"    : job['has_inner_apptainer'],
+           "jobscript_exit"         : job['jobscript_exit'],
+           "allocated_files"        : job['allocated_files'],
            "scope_name"             : job['scope_name'] 
                                       if job['scope_name'] else '',
            "wlcg_group_name"        : job['wlcg_group_name']
-                                      if job['wlcg_group_name'] else ''
+                                      if job['wlcg_group_name'] else '',
+           "quota_processing_enabled" : bool(job['quota_processing_enabled']),
+           "user_processing_enabled"  : bool(job['user_processing_enabled']),
+           "ping_rucio_milliseconds": int(job['ping_rucio_milliseconds'])
          }
 
 # Make a new certificate from the certificate workflow sent by the 
@@ -322,22 +403,22 @@ def delegateJobsProxy(newCertRequest, jobsProxyString):
   if not jobsProxyString:
     print('Failed to read proxy file from disk?', file=sys.stderr)
 
-  jobsProxyKey      = M2Crypto.RSA.load_key_string(jobsProxyString)
-  jobsProxyCertsBIO = M2Crypto.BIO.MemoryBuffer(jobsProxyString)
+  jobsProxyKey      = RSA.load_key_string(jobsProxyString)
+  jobsProxyCertsBIO = BIO.MemoryBuffer(jobsProxyString)
 
   jobsProxyCerts = []
   while True:
     try:
-      jobsProxyCerts.append(M2Crypto.X509.load_cert_bio(jobsProxyCertsBIO))
+      jobsProxyCerts.append(X509.load_cert_bio(jobsProxyCertsBIO))
     except:
       jobsProxyCertsBIO.close()
       break
 
-  newPubKey = M2Crypto.X509.load_request_string(newCertRequest, 
-                                       M2Crypto.X509.FORMAT_PEM).get_pubkey()
+  newPubKey = X509.load_request_string(newCertRequest, 
+                                       X509.FORMAT_PEM).get_pubkey()
 
   # Create and populate new certificate   
-  newCert = M2Crypto.X509.X509()
+  newCert = X509.X509()
   newCert.set_pubkey(newPubKey)
   newCert.set_serial_number(int(time.time() * 100))
   newCert.set_issuer_name(jobsProxyCerts[0].get_subject())
@@ -355,25 +436,25 @@ def delegateJobsProxy(newCertRequest, jobsProxyString):
   newCert.set_subject_name(newSubject)
 
   # Set not before time to now
-  newNotBefore = M2Crypto.ASN1.ASN1_UTCTIME()
+  newNotBefore = ASN1.ASN1_UTCTIME()
   newNotBefore.set_time(int(time.time()))
   newCert.set_not_before(newNotBefore)
 
   # Set not after time to now + 7 days
-  newNotAfter = M2Crypto.ASN1.ASN1_UTCTIME()
+  newNotAfter = ASN1.ASN1_UTCTIME()
   newNotAfter.set_time(int(time.time()) + 604800)
   newCert.set_not_after(newNotAfter)
 
   # Usual extension giving key usage
-  newCert.add_ext(M2Crypto.X509.new_extension("keyUsage", 
+  newCert.add_ext(X509.new_extension("keyUsage", 
                   "Digital Signature, Key Encipherment, Key Agreement", 1))
 
   # Special extension for RFC X.509 proxies 
-  newCert.add_ext(M2Crypto.X509.new_extension("proxyCertInfo", 
+  newCert.add_ext(X509.new_extension("proxyCertInfo", 
                   "critical, language:1.3.6.1.4.1.3536.1.1.1.9", 1, 0))
 
   # Sign this new cert with the VOMS proxy private key
-  jobsProxyKeyEVP = M2Crypto.EVP.PKey()
+  jobsProxyKeyEVP = EVP.PKey()
   jobsProxyKeyEVP.assign_rsa(jobsProxyKey)
   newCert.sign(jobsProxyKeyEVP, 'sha256')
 
@@ -391,9 +472,17 @@ def makeJobscriptDict(jsonDict, jobDict):
   scopeName = jobDict['scope_name']
 
   try:
-    query = ("SELECT jobscript,principal_name FROM stages_jobscripts "
+    query = ("SELECT jobscript,principal_name,jobscript_image,jobscript_git,"
+             "quota_name "
+             "FROM stages_jobscripts "
              "LEFT JOIN workflows "
              "ON workflows.workflow_id=stages_jobscripts.workflow_id "
+             "LEFT JOIN stages "
+             "ON stages.workflow_id=stages_jobscripts.workflow_id "
+             "AND stages.stage_id=stages_jobscripts.stage_id "
+             "LEFT JOIN scopes ON scopes.scope_id=workflows.scope_id "
+             "LEFT JOIN named_quotas "
+             "ON named_quotas.quota_id=scopes.quota_id "
              "LEFT JOIN users ON users.user_id=workflows.user_id "
              "LEFT JOIN principal_names "
              "ON principal_names.pn_id=users.main_pn_id "
@@ -401,15 +490,24 @@ def makeJobscriptDict(jsonDict, jobDict):
              "AND stages_jobscripts.stage_id=%d" 
              % (jsonDict['workflow_id'], jsonDict['stage_id']))
 
-    row       = justin.select(query, justOne = True)
-    jobscript = row['jobscript']
-    jobscriptDict['principal_name'] = row['principal_name']
+    row = justin.select(query, justOne = True)
+    jobscriptDict['principal_name']   = row['principal_name']
+    jobscriptDict['jobscript']        = row['jobscript']
+    jobscriptDict['jobscript_image']  = row['jobscript_image']
+    jobscriptDict['quota_name']       = row['quota_name']
+
+    # TO BE REMOVED ONCE ALL USERS HAVE PERSONAL QUOTAS
+    if jobscriptDict['quota_name'] == 'usertests':
+      jobscriptDict['quota_name'] = 'dunepro'      
+
+    if row['jobscript_git']:
+      jobscriptDict['jobscript_git'] = row['jobscript_git']
+
   except Exception as e:
     print('SELECT stages_jobscripts fails: ' + str(e), file=sys.stderr)
     return None
 
-  jobscriptDict['jobscript'] = jobscript
-
+  
   # Create and add files for VOMS proxies for the job
   try:
     (newCertNoRoles, newChainNoRoles) = \
@@ -433,7 +531,7 @@ def makeJobscriptDict(jsonDict, jobDict):
   # Create a list of the output file patterns
   try:
     query = ("SELECT destination,file_pattern,"
-             "for_next_stage "
+             "for_next_stage,pattern_id "
              "FROM stages_outputs "
              "LEFT JOIN stages "
              "ON stages.workflow_id=stages_outputs.workflow_id "
@@ -451,12 +549,20 @@ def makeJobscriptDict(jsonDict, jobDict):
   jobscriptDict['patterns'] = []
 
   for row in rows:
-    jobscriptDict['patterns'].append((row['for_next_stage'],
-                                      row['destination'],
-      ('::URL::' if row['destination'].startswith('https://') else scopeName),
-                                      row['file_pattern']))
+    if row['destination'].startswith('https://'):
+      patternType = 'url'
+    elif row['for_next_stage']:
+      patternType = 'for_next_stage'
+    else:
+      patternType = ''
+
+    jobscriptDict['patterns'].append((patternType,
+                                      row['file_pattern'],
+                                      row['pattern_id']))
 
   # Create a list of RSEs for Workflow Test jobs
+  # RSEs for uploads by the wrapper job are listed in the record_results
+  # response dictionary not here!
   if jobDict['workflow_id'] == justin.awtWorkflowID:
     try:
       query = ('SELECT rse_name,lan_write_scheme,wan_write_scheme,distance,'
@@ -495,52 +601,13 @@ def makeJobscriptDict(jsonDict, jobDict):
                                         if rseRow['distance'] == 0
                                         else rseRow['wan_write_scheme'],
                                         pfn))
-                        
-  # Create an ordered output RSE list specific to this stage
-  #
-  # When the occupancy figures are usable this needs to have 
-  #  'storages.occupancy < 1.0 AND ' added to WHERE and 
-  #  storages.occupancy added to ORDER BY
-  try:
-    query = ('SELECT rse_name,lan_write_scheme,wan_write_scheme,distance '
-             'FROM storages '
-             'LEFT JOIN stages_output_storages '
-             'ON (storages.rse_id=stages_output_storages.rse_id '
-             'AND stages_output_storages.workflow_id=%d '
-             'AND stages_output_storages.stage_id=%d) '
-             'LEFT JOIN sites_storages '
-             'ON (storages.rse_id=sites_storages.rse_id '
-             'AND sites_storages.site_id=%d) '
-             'WHERE '
-             'sites_storages.distance IS NOT NULL AND '
-             'storages.rucio_write AND '
-             'storages.justin_write AND '
-             'storages.occupancy < 1.0 AND '
-             'NOT storages.decommissioned '
-             'ORDER BY (stages_output_storages.rse_id IS NULL),'
-             'distance,RAND()' 
-             % (jsonDict['workflow_id'],
-                jsonDict['stage_id'],
-                jobDict['site_id']
-               )
-            )
 
-    rseRows = justin.select(query)
-  except:
-    return None
-
-  jobscriptDict['output_rses'] = []
-  for rseRow in rseRows:
-    jobscriptDict['output_rses'].append((rseRow['rse_name'],
-                                         rseRow['lan_write_scheme'] 
-                                         if rseRow['distance'] == 0 
-                                         else rseRow['wan_write_scheme']))
-      
   jobscriptDict['site_name']        = jobDict['site_name']
   jobscriptDict['workflow_id']      = jsonDict['workflow_id']
   jobscriptDict['stage_id']         = jsonDict['stage_id']
   jobscriptDict['scope']            = scopeName
 
+  jobscriptDict['mql']                    = jobDict['mql']
   jobscriptDict['requested_processors']   = jobDict['requested_processors']
   jobscriptDict['requested_rss_bytes']    = jobDict['requested_rss_bytes']
   jobscriptDict['requested_wall_seconds'] = jobDict['requested_wall_seconds']
@@ -571,7 +638,8 @@ def makeJobscriptDict(jsonDict, jobDict):
   return jobscriptDict
 
 def updateTerminalJobState(justinJobID = 0, jobState = '', 
-                           workflowID = 0, stageID = 0, siteID = 0):
+                           workflowID = 0, stageID = 0, siteID = 0,
+                           entryID = 0):
 
 # Update job_state with one of the terminal states
 # THIS DOES A COMMIT TOO AND MUST ONLY BE USED IMMEDIATELY BEFORE
@@ -587,6 +655,8 @@ def updateTerminalJobState(justinJobID = 0, jobState = '',
     eventTypeID = justin.event_JOB_SCRIPT_ERROR
   elif jobState == 'outputting_failed':
     eventTypeID = justin.event_JOB_OUTPUTTING_FAILED
+  elif jobState == 'none_processed':
+    eventTypeID = justin.event_JOB_NONE_PROCESSED
   else:
     raise RuntimeError('state %s not handled by updateTerminalJobState()'
                        % jobState)
@@ -601,7 +671,8 @@ def updateTerminalJobState(justinJobID = 0, jobState = '',
                     workflowID  = workflowID, 
                     stageID     = stageID,
                     justinJobID = justinJobID,
-                    siteID      = siteID
+                    siteID      = siteID,
+                    entryID     = entryID
                    )
 
     justin.conn.commit()
@@ -623,7 +694,6 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
     try:
       n = int(jsonDict[name])
     except:
-#      updateTerminalJobState(jsonDict['jobsub_id'], 'aborted')
       return httpError(startResponse,
                        '400 Bad Request', 
                        'Missing/invalid integer value(s) in JSON')
@@ -633,7 +703,6 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
                'hostname', 'site_job_id']:
     if name not in jsonDict or not justin.stringNoQuotes(jsonDict[name]) \
        or not jsonDict[name]:
-#      updateTerminalJobState(jsonDict['jobsub_id'], 'aborted')
       return httpError(startResponse, 
                        '400 Bad Request', 
                        'Missing/invalid value for %s in JSON' % name)
@@ -642,13 +711,20 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
      jsonDict['entry_name'] == 'UNKNOWN':
     print('Job %s has unknown site_name or entry_name - aborting' 
           % jsonDict['jobsub_id'], file=sys.stderr)
-#    updateTerminalJobState(jsonDict['jobsub_id'], 'aborted')
     return httpError(startResponse, '400 Bad Request', 'Unknown site')
 
   # If the job is in the submitted state then update with host details
   # If not in submitted, then some mismatch which we catch and return 
   # 410 below
   try:
+    if jsonDict['gpu_uuid']:
+      gpuInfo = ('%s %s %s %s %dMiB' 
+                  % (jsonDict['gpu_name'], jsonDict['gpu_driver_version'],
+                     jsonDict['gpu_compute_cap'], jsonDict['gpu_vbios_version'],
+                     int(jsonDict['gpu_nonreserved_bytes'] / 1048576)))
+    else:
+      gpuInfo = ''
+
     justin.insertUpdate('UPDATE jobs SET '
                            'site_id=(SELECT site_id FROM sites '
                            'WHERE site_name="%s"),'
@@ -660,7 +736,8 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
                            'rss_bytes=%d,' 
                            'processors=%d,' 
                            'wall_seconds=%d,'
-                           'has_inner_apptainer=%s ' 
+                           'has_inner_apptainer=%s,'
+                           'gpu_info="%s" ' 
                            'WHERE jobsub_id="%s" AND '
                            'workflow_id=%d AND stage_id=%d AND '
                            'job_state="submitted"' % 
@@ -673,13 +750,13 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
                             jsonDict['processors'],
                             jsonDict['wall_seconds'],
                             jsonDict['has_inner_apptainer'],
+                            gpuInfo,
                             jsonDict['jobsub_id'],
                             jsonDict['workflow_id'],
                             jsonDict['stage_id']
                            ))
     justin.conn.commit()
   except Exception as e:
-#    updateTerminalJobState(jsonDict['jobsub_id'], 'aborted')
     return httpError(startResponse, 
                      '500 Internal Server Error',
                      'justIN allocator service fails to update job with site_id '
@@ -689,6 +766,34 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
   # Find details of the job
   jobDict = makeJobDict(jsonDict)
 
+  if jobDict['ping_rucio_milliseconds'] >= justin.overloadRucioMilliseconds:
+    updateTerminalJobState(justinJobID = jobDict['justin_job_id'],
+                           jobState    = 'notused')
+    return httpError(startResponse,
+                     '503 Service Unavailable',
+                     'New processing suspended while Rucio is overloaded')
+
+  if jobDict['workflow_state'] != 'running':
+    updateTerminalJobState(justinJobID = jobDict['justin_job_id'],
+                           jobState    = 'notused')
+    return httpError(startResponse,
+                     '503 Service Unavailable',
+                     'Workflow not running (%s)' % jobDict['workflow_state'])
+
+  if not jobDict['user_processing_enabled']:
+    updateTerminalJobState(justinJobID = jobDict['justin_job_id'],
+                           jobState    = 'notused')
+    return httpError(startResponse,
+                     '403 Forbidden',
+                     'Processing disabled for this user')
+
+  if not jobDict['quota_processing_enabled']:
+    updateTerminalJobState(justinJobID = jobDict['justin_job_id'],
+                           jobState    = 'notused')
+    return httpError(startResponse,
+                     '403 Forbidden',
+                     'Processing disabled for this named quota')
+
   if (jobDict['workflow_id'] != jsonDict['workflow_id']) or \
      (jobDict['stage_id'] != jsonDict['stage_id']):
     updateTerminalJobState(justinJobID = jobDict['justin_job_id'],
@@ -696,6 +801,37 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
     return httpError(startResponse,
                      '403 Forbidden',
                      'workflow ID / stage ID do not match jobsub ID')
+
+  # Record whether job slots from this entry always support Inner Apptainer
+  # 0=not always, 1=not known, 2=always
+  if jsonDict['has_inner_apptainer']:
+    if jobDict['entry_a_i_a'] == 1:
+      entryApptainerSQL = ',always_inner_apptainer=2'
+    else:
+      entryApptainerSQL = ''
+
+    if jobDict['site_a_i_a'] == 1:
+      siteApptainerSQL = ',always_inner_apptainer=2'
+    else:
+      siteApptainerSQL = ''
+  else:
+    siteApptainerSQL  = ',always_inner_apptainer=0'
+    entryApptainerSQL = ',always_inner_apptainer=0'
+
+  try:
+    justin.insertUpdate('UPDATE sites SET last_get_jobscript_time=NOW()%s '
+                        'WHERE site_id=%d' 
+                        % (siteApptainerSQL, jobDict['site_id']))
+    justin.insertUpdate('UPDATE entries SET last_get_jobscript_time=NOW()%s '
+                        'WHERE entry_id=%d' 
+                        % (entryApptainerSQL, jobDict['entry_id']))
+    justin.conn.commit()
+  except:
+    updateTerminalJobState(justinJobID = jobDict['justin_job_id'], 
+                           jobState    = 'aborted')
+    return httpError(startResponse, 
+                 '500 Internal Server Error',
+                 'justIN allocator service fails to record get_jobscript time')
 
   # Check that we're not trying to run unprivileged jobscripts 
   # without Inner Apptainer: some kind of out of date matching?
@@ -708,7 +844,7 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
     return httpError(startResponse,
               '404 Not Found',
               'Tried to run an unprivileged workflow without Inner Apptainer')
-    
+
   if jobDict['error_message']:
     updateTerminalJobState(justinJobID = jobDict['justin_job_id'], 
                            jobState    = 'aborted')
@@ -735,36 +871,6 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
                      'Cannot start as site %s not enabled' 
                      % jobDict['site_name'])
 
-  # Record whether job slots from this entry always support Inner Apptainer
-  # 0=not always, 1=not known, 2=always
-  if jsonDict['has_inner_apptainer']:
-    if jobDict['entry_a_i_a'] == 1:
-      entryApptainerSQL = ',always_inner_apptainer=2'
-    else:
-      entryApptainerSQL = ''
-
-    if jobDict['site_a_i_a'] == 1:
-      siteApptainerSQL = ',always_inner_apptainer=2'
-    else:
-      siteApptainerSQL = ''
-  else:
-    siteApptainerSQL  = ',always_inner_apptainer=0'
-    entryApptainerSQL = ',always_inner_apptainer=0'
-
-  try:
-    justin.insertUpdate('UPDATE sites SET last_get_jobscript_time=NOW()%s '
-                        'WHERE site_id=%d' 
-                        % (siteApptainerSQL, jobDict['site_id']))
-    justin.insertUpdate('UPDATE entries SET last_get_jobscript_time=NOW()%s '
-                        'WHERE entry_id=%d' 
-                        % (entryApptainerSQL, jobDict['entry_id']))
-  except:
-    updateTerminalJobState(justinJobID = jobDict['justin_job_id'], 
-                           jobState    = 'aborted')
-    return httpError(startResponse, 
-                 '500 Internal Server Error',
-                 'justIN allocator service fails to record get_jobscript time')
-
   jobscriptDict = makeJobscriptDict(jsonDict, jobDict)
   if not jobscriptDict:
     updateTerminalJobState(justinJobID = jobDict['justin_job_id'], 
@@ -784,7 +890,6 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
              'heartbeat_time=NOW(),'
              'finished_time="%s",' 
              'job_state="%s",'
-             'has_allocations=TRUE,'
              'allocator_name="%s",' 
              'workflow_id=%d,'
              'stage_id=%d '
@@ -802,7 +907,8 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
                     workflowID = jsonDict['workflow_id'],
                     stageID = jsonDict['stage_id'],
                     justinJobID = jobDict['justin_job_id'],
-                    siteID = jobDict['site_id']
+                    siteID = jobDict['site_id'],
+                    entryID = jobDict['entry_id']
                    )
 
     if jsonDict['workflow_id']==justin.awtWorkflowID:
@@ -811,7 +917,8 @@ def getJobscriptMethod(startResponse, jsonDict, environ):
                       workflowID = jsonDict['workflow_id'],
                       stageID = jsonDict['stage_id'],
                       justinJobID = jobDict['justin_job_id'],
-                      siteID = jobDict['site_id']
+                      siteID = jobDict['site_id'],
+                      entryID = jobDict['entry_id']
                      )
 
   except Exception as e:
@@ -861,7 +968,8 @@ def sendHeartbeatMethod(startResponse, jsonDict):
 def jobAbortedMethod(startResponse, jsonDict):
 
   try:
-    httpCode = int(jsonDict['http_code'])
+    # Default event type ID is just the abort_code
+    eventTypeID = int(jsonDict['abort_code'])
   except:
     return httpError(startResponse, 
                      '400 Bad Request', 
@@ -881,34 +989,39 @@ def jobAbortedMethod(startResponse, jsonDict):
                      jobDict['error_message'] + ' in jobAbortedMethod')
 
   if jobDict['job_state'] not in ['submitted','notused','started',
-                                  'processing','outputting','jobscript_error']:
+                                  'processing','outputting',
+                                  'jobscript_error','none_processed']:
     return httpError(startResponse, 
                      '410 Gone', 
                      'Cannot set job to aborted as job already in %s state' 
                      % jobDict['job_state'])
 
-  # All ok, now process the message
+  # Work out the job state to set, from the given event type ID
 
-  if httpCode == 404 and jsonDict['aborted_method'] == 'get_jobscript':
-    state = 'notused'
-    eventTypeID = justin.event_JOB_NOTUSED
-  elif jsonDict['aborted_method'] == 'jobscript_error':
+  if eventTypeID == justin.event_JOB_ABORT_SCRIPT_ERROR:
     state = 'jobscript_error'
-    eventTypeID = justin.event_JOB_SCRIPT_ERROR
-  elif jsonDict['aborted_method'] in [ 'rucio_attach', 'rucio_upload',
-                                       'metacat_declare' ]:
-# WANT TO RESET FILE ALLOCATIONS TOO?
+    
+  elif eventTypeID in [ justin.event_JOB_ABORT_CREATING_LOGS_TGZ,
+                        justin.event_JOB_ABORT_METACAT_LOGS_CREATION,
+                        justin.event_JOB_ABORT_METACAT_LOGS_REGISTRATION,
+                        justin.event_JOB_ABORT_RUCIO_UPLOAD_LOGS,
+                        justin.event_JOB_ABORT_WEBDAV_UPLOAD,
+                        justin.event_JOB_ABORT_CREATING_METADATA,
+                        justin.event_JOB_ABORT_METACAT_REGISTRATION,
+                        justin.event_JOB_ABORT_RUCIO_UPLOAD_FILE,
+                        justin.event_JOB_ABORT_METACAT_UPLOADED,
+                        justin.event_JOB_ABORT_RUCIO_SILENT_FAILURE ]:
+# WANT TO RESET FILE ALLOCATIONS TOO HERE?
     state = 'outputting_failed'
-    eventTypeID = justin.event_JOB_OUTPUTTING_FAILED
   else:
     state = 'aborted'
-    eventTypeID = justin.event_JOB_ABORTED
 
-  print('Job %s aborted: %d %s' % (str(jsonDict['jobsub_id']),
-                                   eventTypeID,
-                                   str(jsonDict['aborted_method'])),
+  print('Job %s aborted: %d %s' 
+        % (str(jsonDict['jobsub_id']),
+           eventTypeID,
+           str(jsonDict['aborted_method'])),
         file=sys.stderr)
- 
+
   try:
     justin.insertUpdate(
              'UPDATE jobs SET job_state="%s",'
@@ -922,12 +1035,14 @@ def jobAbortedMethod(startResponse, jsonDict):
     else:
       rseName = None
 
-    justin.logEvent(eventTypeID  = eventTypeID,
-                    workflowID   = jobDict['workflow_id'],
-                    stageID      = jobDict['stage_id'],
-                    justinJobID  = jobDict['justin_job_id'],
-                    siteID       = jobDict['site_id'],
-                    rseName      = rseName
+    justin.logEvent(eventTypeID   = eventTypeID,
+                    workflowID    = jobDict['workflow_id'],
+                    stageID       = jobDict['stage_id'],
+                    justinJobID   = jobDict['justin_job_id'],
+                    jobscriptExit = jobDict['jobscript_exit'],
+                    siteID        = jobDict['site_id'],
+                    entryID       = jobDict['entry_id'],
+                    rseName       = rseName
                    )
 
   except Exception as e:
@@ -955,12 +1070,17 @@ def cacheFiles(siteID, workflowID, stageID, maxDistance):
                    'LEFT JOIN sites_storages ON '
                    'replicas.rse_id=sites_storages.rse_id AND '
                    'sites_storages.site_id=%d '
+                   'LEFT JOIN stages_input_storages '
+                   'ON stages_input_storages.workflow_id=files.workflow_id '
+                   'AND stages_input_storages.stage_id=files.stage_id '
+                   'AND stages_input_storages.rse_id=replicas.rse_id '
                    'WHERE files.workflow_id=%d AND files.stage_id=%d AND '
                    'files.state="unallocated" AND '
                    'distance<=%f AND '
                    'accessible_until > NOW() AND '
                    'storages.rucio_read AND storages.justin_read AND '
-                   'NOT storages.decommissioned '
+                   'NOT storages.decommissioned AND '
+                   'stages_input_storages.rse_id IS NOT NULL '
                    'ORDER by distance,replicas.file_id LIMIT 1000' % 
                    (siteID, workflowID, stageID, maxDistance))
   except Exception as e:
@@ -1142,7 +1262,7 @@ def findBestFile(jobDict):
       try:
         getCacheLock('justin_allocator_file_cache', 0)
       except Exception as e:
-# THIS EXCEPTION WILL HAPPEN ALL THE TIME NORMALLY SO print() NOT FOR PROD
+# THIS EXCEPTION WILL HAPPEN ALL THE TIME NORMALLY SO print() NOT FOR PROD?
         # We didn't get the cache lock so we carry on with what was returned
         print('%s/%d/%d Did not get file cache lock: %s'
               % (jobDict['site_name'],
@@ -1178,15 +1298,20 @@ def findBestFile(jobDict):
              "WHERE state='unallocated' AND "
              "file_id=" + str(replicaRows[0]['file_id'])
             )
-    affectedRows = justin.cur.execute(query)
+    affectedRows = justin.update(query)
   except Exception as e:
     # If anything goes wrong, we stop straightaway
     return { 'error_message': 'Failed recording state change: ' + str(e) }
 
   if affectedRows != 1:
-    return { 'error_message': 
-             'Failed to allocate the chosen file (%s): already allocated???'
-             % str(replicaRows[0]['file_did']) }
+# CAN WE GET RID OF THE RACE SCENARIO THAT PRODUCES THESE AT 0.3% LEVEL?
+# SOME LIMITED RETRYING OF THE OTHER RETURNED FILES?
+    print('Failed to allocate the chosen file (%s): already allocated???'
+          % str(replicaRows[0]['file_did']), file=sys.stderr)
+
+    # But we return as if no file was found
+    return { 'error_message': None,
+             'file_did'     : None  }
     
   justin.logEvent(eventTypeID = justin.event_FILE_ALLOCATED,
                      workflowID     = jobDict['workflow_id'],
@@ -1194,6 +1319,7 @@ def findBestFile(jobDict):
                      fileID         = replicaRows[0]['file_id'],
                      justinJobID    = jobDict['justin_job_id'],
                      siteID         = jobDict['site_id'],
+                     entryID        = jobDict['entry_id'],
                      rseID          = replicaRows[0]['rse_id'])
 
   # If storage is at the same site and a lan PFN is given, use it
@@ -1241,6 +1367,33 @@ def getFileMethod(startResponse, jsonDict):
                      'Job in wrong state to find file (%s)' % 
                      jobDict['job_state'])
 
+  if jobDict['workflow_state'] != 'running':
+    return httpError(startResponse,
+                     '404 Not Found', 
+                     'Workflow not in running state (%s)' % 
+                     jobDict['workflow_state'])
+
+  if not jobDict['user_processing_enabled']:
+    return httpError(startResponse,
+                     '404 Not Found', 
+                     'Processing now disabled for this user')
+
+  if not jobDict['quota_processing_enabled']:
+    return httpError(startResponse,
+                     '404 Not Found', 
+                     'Processing now disabled for this named quota')
+
+  if jobDict['allocated_files'] >= justin.maxFilesPerJob:
+    return httpError(startResponse,
+                     '404 Not Found', 
+                     'Only %d files can be allocated to each job'
+                     % justin.maxFilesPerJob)
+
+  if jobDict['ping_rucio_milliseconds'] >= justin.overloadRucioMilliseconds:
+    return httpError(startResponse,
+                     '503 Service Unavailable', 
+                     'File allocations suspended while Rucio is overloaded')
+
   # Create a stage dictionary with the next file in this stage  
   oneFile = findBestFile(jobDict)
 
@@ -1253,7 +1406,9 @@ def getFileMethod(startResponse, jsonDict):
     try:
       # Update heartbeat_time and make sure job is set to processing now
       justin.insertUpdate('UPDATE jobs SET job_state="processing",'
-                          'heartbeat_time=NOW() '
+                          'heartbeat_time=NOW(),'
+                          'allocated_files=allocated_files+1,'
+                          'sent_get_file=TRUE '
                           'WHERE jobsub_id="' + jsonDict['jobsub_id'] + '"'
                          )
       # Note that AWT jobs go to processing when they get the jobscript
@@ -1265,7 +1420,8 @@ def getFileMethod(startResponse, jsonDict):
                         workflowID  = jobDict['workflow_id'],
                         stageID     = jobDict['stage_id'],
                         justinJobID = jobDict['justin_job_id'],
-                        siteID      = jobDict['site_id']
+                        siteID      = jobDict['site_id'],
+                        entryID     = jobDict['entry_id']
                        )
 
     except Exception as e:
@@ -1283,9 +1439,21 @@ def getFileMethod(startResponse, jsonDict):
                     oneFile['rse_name'])
 
   # No file eligible to be processed by this job
-  return httpError(startResponse, 
-                   '404 Not Found', 
-                   'No eligible file found')
+  try:
+    # Update heartbeat_time and make sure job is set to processing now
+    justin.insertUpdate('UPDATE jobs '
+                        'SET heartbeat_time=NOW(),sent_get_file=TRUE '
+                        'WHERE jobsub_id="' + jsonDict['jobsub_id'] + '"'
+                       )
+  except Exception as e:
+    return httpError(startResponse,
+                     '500 Internal Server Error',
+                     'Unable to update job to sent_get_file=TRUE: ' + str(e))
+
+  # Use httpOK() since this does not do a rollback
+  return httpOK(startResponse,
+                'No eligible file found',
+                codeStr = '404 Not Found')
 
 def updateFileProcessing(fileIDList,
                          state, justinJobID, workflowID, stageID):
@@ -1302,7 +1470,7 @@ def updateFileProcessing(fileIDList,
     if state == 'unprocessed':
       # If already at max allocations, go to failed rather than unallocated!
       query = ('UPDATE files SET '
-               'state=IF(allocations < ' + str(justin.maxAllocations) + ','
+               'state=IF(allocations < max_allocations,'
                '"unallocated","failed") '
                'WHERE (' + ' OR '.join(testFileIDs) + ') '
                'AND justin_job_id=' + str(justinJobID) + ' '
@@ -1321,24 +1489,43 @@ def updateFileProcessing(fileIDList,
     
 # Deal with the output files needed by the next stage
 # Caller must handle exceptions!
-def processOutputDids(outputDids, workflowID, stageID, justinJobID):
+def processOutputFiles(outputFiles, patternsDict, 
+                       scopeName, workflowID, stageID, justinJobID):
 
-  for outputDid in outputDids:
+  for (fileName, patternID) in outputFiles:
       
-    if '"' in outputDid or "'" in outputDid:
+    if '"' in fileName or "'" in fileName:
       continue
 
-    justin.insertUpdate('INSERT INTO files SET state="recorded",'
-                        'file_did="'          + str(outputDid) + '",'
-                        'creator_justin_job_id=' + str(justinJobID)  + ','
-                        'workflow_id='         + str(workflowID) + ','
-                        'stage_id='           + str(stageID + 1)
-                       )
+    if patternsDict[patternID]['destination'].startswith('https://'):
+      justin.insertUpdate('INSERT INTO files SET state="recorded",'
+                          'file_did="%s/%s",'
+                          'creator_justin_job_id=%d,'
+                          'workflow_id=%d,'
+                          'creator_stage_id=%d,'
+                          'creator_pattern_id=%d,'
+                          'stage_id=0' %
+                          (patternsDict[patternID]['destination'], fileName,
+                           justinJobID, 
+                           workflowID, stageID, patternID)
+                         )
+    else:
+      justin.insertUpdate('INSERT INTO files SET state="recorded",'
+                          'file_did="%s:%s",'
+                          'creator_justin_job_id=%d,'
+                          'workflow_id=%d,'
+                          'creator_stage_id=%d,'
+                          'creator_pattern_id=%d,'
+                          'stage_id=%d' %
+          (scopeName, fileName, justinJobID, workflowID, stageID, patternID,
+           stageID+1 if patternsDict[patternID]['for_next_stage'] else 0)
+                         )
 
-def saveAwtResults(justinJobID, siteID, jobscriptLog, hasInnerApptainer):
+def saveAwtResults(justinJobID, siteID, entryID, 
+                   jobscriptLog, hasInnerApptainer, requestedGPU):
 
 # REMOVE prints FOR PRODUCTION
-  print('Start saveAwtResults', file=sys.stderr)
+#  print('Start saveAwtResults', file=sys.stderr)
 
   for line in jobscriptLog.splitlines():
     if line.startswith('==awt== '):
@@ -1365,6 +1552,7 @@ def saveAwtResults(justinJobID, siteID, jobscriptLog, hasInnerApptainer):
                         stageID = 1,
                         justinJobID = justinJobID,
                         siteID = siteID,
+                        entryID = entryID,
                         rseName = lineSplitted[2]
                        )
 
@@ -1376,6 +1564,7 @@ def saveAwtResults(justinJobID, siteID, jobscriptLog, hasInnerApptainer):
                         stageID = 1,
                         justinJobID = justinJobID,
                         siteID = siteID,
+                        entryID = entryID,
                         rseName = lineSplitted[2]
                        )
 
@@ -1384,9 +1573,19 @@ def saveAwtResults(justinJobID, siteID, jobscriptLog, hasInnerApptainer):
               file=sys.stderr)
 
   try:
+    if requestedGPU:
+      gpuStr = ', last_awt_gpu_time=NOW(), last_awt_gpu_job_id=%d' \
+               % justinJobID
+    else:
+      gpuStr = ''
+
     justin.insertUpdate('UPDATE sites SET '
+                        'last_awt_time=NOW(), last_awt_job_id=%d%s '
+                        'WHERE site_id=%d' % (justinJobID, gpuStr, siteID))
+
+    justin.insertUpdate('UPDATE entries SET '
                         'last_awt_time=NOW(), last_awt_job_id=%d '
-                        'WHERE site_id=%d' % (justinJobID, siteID))
+                        'WHERE entry_id=%d' % (justinJobID, entryID))
 
   except Exception as e:
     print('Update awt last time fails with %s' % str(e), 
@@ -1403,8 +1602,7 @@ def recordResultsMethod(startResponse, jsonDict):
                      'Missing jobsub_id in JSON')
 
   # Check jsonDict contains required lists (can be empty)
-  for name in ['processed_dids', 'processed_pfns', 
-               'output_dids', 'output_urls', 'next_stage_dids']:
+  for name in ['processed_dids', 'processed_pfns']:
     if name not in jsonDict:
       return httpError(startResponse,
                        '400 Bad Request',
@@ -1415,14 +1613,36 @@ def recordResultsMethod(startResponse, jsonDict):
         return httpError(startResponse,
                          '400 Bad Request',
                          'Invalid DID or PFN in ' + name)
+
+  if 'output_files' not in jsonDict:
+    return httpError(startResponse,
+                     '400 Bad Request',
+                     'Missing value output_files in JSON')
+
+  for fileName,patternID in jsonDict['output_files']:
+    if not justin.stringNoQuotes(fileName):
+      return httpError(startResponse,
+                       '400 Bad Request',
+                       'Invalid filename ' + fileName)
+
+  responseDict = {}
       
   try:
     query = ('SELECT jobs.justin_job_id, jobs.workflow_id, jobs.stage_id,'
-             'jobs.site_id, users.access_token, '
-             'jobs.has_inner_apptainer, jobs.job_state '
+             'jobs.site_id, jobs.entry_id, users.access_token, '
+             'jobs.has_inner_apptainer, jobs.job_state, workflows.state, '
+             'scope_name, jobs.requested_gpu, scopes.quota_id, '
+             'principal_name, '
+             'users.processing_enabled AS user_processing_enabled, '
+             'quota_name, '
+             'named_quotas.processing_enabled AS quota_processing_enabled '
              'FROM jobs '
              'LEFT JOIN workflows ON workflows.workflow_id=jobs.workflow_id '
              'LEFT JOIN users ON users.user_id=workflows.user_id '
+             'LEFT JOIN principal_names '
+             'ON users.main_pn_id=principal_names.pn_id '
+             'LEFT JOIN scopes ON workflows.scope_id=scopes.scope_id '
+             'LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id '
              'WHERE jobs.jobsub_id="' + jsonDict['jobsub_id'] + '"')
 
     row = justin.select(query, justOne = True)
@@ -1430,16 +1650,40 @@ def recordResultsMethod(startResponse, jsonDict):
     justinJobID       = int(row['justin_job_id'])
     workflowID        = int(row['workflow_id'])
     stageID           = int(row['stage_id'])
+    scopeName         = row['scope_name']
     siteID            = int(row['site_id'])
-    userAccessToken   = row['access_token']
+    entryID           = int(row['entry_id'])
     hasInnerApptainer = row['has_inner_apptainer']
+    requestedGPU      = row['requested_gpu']
     jobState          = row['job_state']
-  except:
+    responseDict['user_access_token'] = row['access_token']
+    quotaID           = row['quota_id']
+  except Exception as e: 
     return httpError(startResponse,
                      '500 Internal Server Error',
-                     'Failed finding job')
+                     'Failed finding job: ' + str(e))
 
-  if jobState != 'processing':
+  # This is mainly to catch outputs from workflows what have been aborted
+  # by the user
+  if row['state'] != 'running' and row['state'] != 'paused':
+    return httpError(startResponse, 
+                     '410 Gone', 
+                     'Cannot record results as workflow now in %s state' 
+                     % row['state'])
+    
+  if not row['user_processing_enabled']:
+    return httpError(startResponse,
+            '403 Forbidden', 
+            'Cannot record results as processing now not enabled for user  %s'
+            % row['principal_name'])
+
+  if not row['quota_processing_enabled']:
+    return httpError(startResponse,
+            '403 Forbidden', 
+            'Cannot record results as processing now not enabled for quota %s'
+            % row['quota_name'])
+
+  if jobState != 'started' and jobState != 'processing':
     return httpError(startResponse, 
                      '410 Gone', 
                      'Cannot record results as job already in %s state' 
@@ -1447,22 +1691,64 @@ def recordResultsMethod(startResponse, jsonDict):
 
   try:
     justin.insertUpdate(
-        'INSERT INTO jobs_logs SET justin_job_id=' + str(justinJobID) + ','
-        'jobscript_log="%s"' %
-        jsonDict['jobscript_log'].replace('\\','\\\\').replace('"','\\"')
-                       )                           
-  except Exception as e:
-    return httpError(startResponse,
-                     '500 Internal Server Error',
-                     'Failed saving job log: ' + str(e))
+        'UPDATE jobs_logs SET '
+        'jobscript_log="%s",saved_time=NOW() WHERE justin_job_id=%d' %
+        (jsonDict['jobscript_log'].replace('\\','\\\\').replace('"','\\"'),
+         justinJobID)  )
 
-#  print('Before call saveAwtResults %d %d' 
-#        % (workflowID, justin.awtWorkflowID), file=sys.stderr)
+  except Exception as e:
+    # Try to keep going. 
+    print('Failed to save jobscript log for %s: %s' 
+          % (str(justinJobID), str(e)), file=sys.stderr)
+
   if workflowID == justin.awtWorkflowID:
     saveAwtResults(justinJobID, 
                    siteID, 
+                   entryID,
                    jsonDict['jobscript_log'],
-                   hasInnerApptainer)
+                   hasInnerApptainer,
+                   requestedGPU)
+
+  # Create an ordered output RSE list specific to this stage, used for logs
+  # and any output files going to RSEs
+  try:
+    # 10000000000 bytes = 10 GB is buffer space to allow for other jobs
+    query = ('SELECT rse_name,lan_write_scheme,wan_write_scheme,distance '
+             'FROM stages_output_storages '
+             'LEFT JOIN storages '
+             'ON stages_output_storages.rse_id=storages.rse_id '
+             'LEFT JOIN sites_storages '
+             'ON (stages_output_storages.rse_id=sites_storages.rse_id '
+             'AND sites_storages.site_id=%d) '
+             'LEFT JOIN storages_quotas '
+             'ON storages_quotas.quota_id=%d '
+             'AND storages_quotas.rse_id=storages.rse_id '
+             'WHERE '
+             '(bytes + 10000000000 < bytes_limit) AND '
+             'stages_output_storages.workflow_id=%d AND '
+             'stages_output_storages.stage_id=%d AND '
+             'sites_storages.distance IS NOT NULL AND '
+             'storages.rucio_write AND '
+             'storages.justin_write AND '
+             'storages.occupancy < 1.0 AND '
+             'NOT storages.decommissioned '
+             'ORDER BY stages_output_storages.preferred DESC,'
+             'distance,storages.occupancy,RAND()'
+             % (siteID, quotaID, workflowID, stageID)
+            )
+
+    rseRows = justin.select(query)
+  except Exception as e:
+    return httpError(startResponse, 
+                     '500 Internal Server Error', 
+                     'Failed getting output RSEs list: ' + str(e))
+
+  responseDict['output_rses'] = []
+  for rseRow in rseRows:
+    responseDict['output_rses'].append((rseRow['rse_name'],
+                                        rseRow['lan_write_scheme'] 
+                                        if rseRow['distance'] == 0 
+                                        else rseRow['wan_write_scheme']))
 
   if 'jobscript_exit' in jsonDict and jsonDict['jobscript_exit'] != 0:
     # Jobscript said it failed by exiting with non-zero value
@@ -1478,11 +1764,13 @@ def recordResultsMethod(startResponse, jsonDict):
                           (jsonDict['jobscript_exit'],
                            jsonDict['jobsub_id']))
 
-      justin.logEvent(eventTypeID  = justin.event_JOB_SCRIPT_ERROR,
-                      workflowID   = workflowID,
-                      stageID      = stageID,
-                      justinJobID  = justinJobID,
-                      siteID       = siteID
+      justin.logEvent(eventTypeID    = justin.event_JOB_SCRIPT_ERROR,
+                      workflowID     = workflowID,
+                      stageID        = stageID,
+                      justinJobID    = justinJobID,
+                      jobscriptExit  = jsonDict['jobscript_exit'],
+                      siteID         = siteID,
+                      entryID        = entryID
                      )
 
     except Exception as e:
@@ -1493,8 +1781,7 @@ def recordResultsMethod(startResponse, jsonDict):
     # Do file allocation resets
     try:
       justin.insertUpdate('UPDATE files SET '
-                          'state=IF(allocations < ' + 
-                          str(justin.maxAllocations) + ','
+                          'state=IF(allocations < max_allocations,' 
                           '"unallocated","failed") '
                           'WHERE justin_job_id=%d AND '
                           '(state="allocated" OR state="outputting")' 
@@ -1503,8 +1790,10 @@ def recordResultsMethod(startResponse, jsonDict):
       return httpError(startResponse,
                        '500 Internal Server Error',
                        'Failed resetting allocated files: ' + str(e))
-     
-    return httpOK(startResponse, '')
+
+    # Return 200 OK and a partially filled in resonseDict
+    return httpOK(startResponse, 
+                  json.dumps(responseDict))
 
   try:
     # Use the event records to find the right replicas for this job
@@ -1532,6 +1821,15 @@ def recordResultsMethod(startResponse, jsonDict):
        (jobFile['lan_pfn'] and 
         jobFile['lan_pfn'] in jsonDict['processed_pfns']):
       processedFileIDs.append(jobFile['file_id'])
+
+      justin.logEvent(eventTypeID = justin.event_FILE_PROCESSED,
+                      workflowID  = workflowID,
+                      stageID     = stageID,
+                      justinJobID = justinJobID,
+                      siteID      = siteID,
+                      entryID     = entryID,
+                      fileID      = jobFile['file_id']
+                     )
     else:
       print('Set unprocessed',jsonDict['jobsub_id'],
             jobFile['file_did'],
@@ -1560,23 +1858,93 @@ def recordResultsMethod(startResponse, jsonDict):
     return httpError(startResponse,
                      '500 Internal Server Error', 
                      'Failed updating file statuses: ' + str(e))
-          
+
+  # Get the patterns
   try:
-    processOutputDids(jsonDict['next_stage_dids'],
-                      workflowID, stageID, justinJobID)
+    query = ("SELECT destination,rse_expression,"
+             "for_next_stage,pattern_id,number_files,lifetime_seconds "
+             "FROM stages_outputs "
+             "WHERE stages_outputs.workflow_id=%d "
+             "AND stages_outputs.stage_id=%d" 
+             % (jsonDict['workflow_id'], jsonDict['stage_id']))
+
+    patternRows = justin.select(query)
   except Exception as e:
     return httpError(startResponse, 
                      '500 Internal Server Error', 
-                     'Failed recording next stage outputs: ' + str(e))
+                     'Failed getting patterns list: ' + str(e))
+
+  # First pass to count how many files per destination already, allowing for
+  # multiple patterns outputting to the same destination
+  destinationCounts = {}
+  for patternRow in patternRows:
+   if patternRow['destination'] not in destinationCounts:
+     destinationCounts[patternRow['destination']]  = patternRow['number_files']
+   else:
+     destinationCounts[patternRow['destination']] += patternRow['number_files']
+    
+  # Create a list of the output file patterns
+  responseDict['patterns'] = {}
+
+  for patternRow in patternRows:
+    patternID = int(patternRow['pattern_id'])
+    responseDict['patterns'][patternID] = {}
+    if patternRow['destination'] in destinationCounts:
+      numberFiles = destinationCounts[patternRow['destination']]
+    else:
+      numberFiles = 0
+
+    if patternRow['destination'].startswith('https://'):
+      responseDict['patterns'][patternID]['destination'] = \
+        patternRow['destination'] + \
+        '/%03d' % (1 + int(numberFiles / justin.filesPerNumberedDestination))
+
+    else:
+      responseDict['patterns'][patternID]['destination'] = \
+        patternRow['destination'] 
+
+      responseDict['patterns'][patternID]['destination_number'] = \
+        'n%03d' % (1 + int(numberFiles / justin.filesPerNumberedDestination))
+
+      responseDict['patterns'][patternID]['for_next_stage'] \
+             = patternRow['for_next_stage']
+
+      responseDict['patterns'][patternID]['lifetime_seconds'] \
+             = patternRow['lifetime_seconds']
+
+      responseDict['patterns'][patternID]['rse_expression'] \
+             = patternRow['rse_expression']
+
+  # List of datasets already created for this workflow/stage
+  try:
+    query = ("SELECT dataset_did "
+             "FROM workflows_datasets "
+             "WHERE workflow_id=%d AND stage_id=%d" 
+             % (jsonDict['workflow_id'], jsonDict['stage_id']))
+
+    datasetRows = justin.select(query)
+  except Exception as e:
+    return httpError(startResponse, 
+                     '500 Internal Server Error', 
+                     'Failed getting list of datasets: ' + str(e))
+
+  responseDict['existing_dataset_dids'] = []
+  for datasetRow in datasetRows:
+    responseDict['existing_dataset_dids'].append(datasetRow['dataset_did'])
+
+  # Record output files
 
   try:
-    # We set stageID=-1 so that when 1 is added, the output only 
-    # StageID of 0 is recorded
-    processOutputDids(jsonDict['output_dids'], workflowID, -1, justinJobID)
+    processOutputFiles(jsonDict['output_files'], responseDict['patterns'],
+                       scopeName, workflowID, stageID, justinJobID)
+  except MySQLdb.IntegrityError as e:
+    return httpError(startResponse, 
+                     '409 Duplicate output file name', 
+                     'Duplicate output file name: ' + str(e))
   except Exception as e:
     return httpError(startResponse, 
                      '500 Internal Server Error', 
-                     'Failed recording outputs: ' + str(e))
+                     'Failed recording output files: ' + str(e))
 
   try:
     jobscriptRealSeconds = int(float(jsonDict['jobscript_real_seconds']))
@@ -1606,7 +1974,8 @@ def recordResultsMethod(startResponse, jsonDict):
                     workflowID  = workflowID,
                     stageID     = stageID,
                     justinJobID = justinJobID,
-                    siteID      = siteID
+                    siteID      = siteID,
+                    entryID     = entryID
                    )
 
   except Exception as e:
@@ -1615,7 +1984,7 @@ def recordResultsMethod(startResponse, jsonDict):
                      'Failed updating jobs: ' + str(e))
 
   return httpOK(startResponse, 
-                json.dumps({ 'user_access_token' : userAccessToken }))
+                json.dumps(responseDict))
 
 # Return a list of file DIDs allocated to this job.
 # This can be used by jobscripts which don't have a keep of input
@@ -1749,16 +2118,18 @@ def confirmResultsMethod(startResponse, jsonDict):
                      'Missing jobsub_id in JSON')
 
   try:
-    query = ('SELECT justin_job_id,workflow_id,stage_id,site_id,job_state '
-             'FROM jobs WHERE jobsub_id="' + jsonDict['jobsub_id'] + '"')
+    query = ('SELECT justin_job_id,workflow_id,stage_id,site_id,entry_id,'
+             'job_state FROM jobs '
+             'WHERE jobsub_id="' + jsonDict['jobsub_id'] + '"')
 
     row = justin.select(query, justOne = True)
 
     justinJobID  = int(row['justin_job_id'])
-    workflowID = int(row['workflow_id'])
-    stageID   = int(row['stage_id'])
-    siteID    = int(row['site_id'])
-    jobState  = row['job_state']
+    workflowID   = int(row['workflow_id'])
+    stageID      = int(row['stage_id'])
+    siteID       = int(row['site_id'])
+    entryID      = int(row['entry_id'])
+    jobState     = row['job_state']
   except:
     return httpError(startResponse,
                      '500 Internal Server Error',
@@ -1783,25 +2154,43 @@ def confirmResultsMethod(startResponse, jsonDict):
                      'Updating processed input files')
 
   try:
-    fileRows = justin.select('SELECT file_did,file_id,stage_id FROM files '
-                             'WHERE state="recorded" AND '
+    fileRows = justin.select('SELECT file_did,file_id,files.creator_stage_id,'
+                             'creator_pattern_id,destination,files.stage_id '
+                             'FROM files '
+                             'LEFT JOIN stages_outputs '
+                             'ON stages_outputs.workflow_id=files.workflow_id '
+                             'AND stages_outputs.stage_id=files.creator_stage_id '
+                             'AND stages_outputs.pattern_id=creator_pattern_id '
+                             'WHERE files.state="recorded" AND '
                              'creator_justin_job_id=%d' % justinJobID)
-  except:
+  except Exception as e:
     return httpError(startResponse,
                      '500 Internal Server Error',
-                     'Getting recorded output files')
+                     'Getting recorded output files: ' + str(e))
 
   for fileRow in fileRows:
+    if fileRow['file_did'].startswith('https://'):
+      fileName = fileRow['file_did'].split('/')[-1]
+    else:
+      fileName = fileRow['file_did'].split(':')[1]
+
+    if fileName not in jsonDict['output_files']:
+      # Recorded but not actually uploaded!
+      # SHOULD THIS HAVE AN EVENT? SKIP SILENTLY FOR NOW
+      continue
   
     try:
       try:
-        rseName   = jsonDict['output_dids'][fileRow['file_did']]['rse_name']
-        sizeBytes = jsonDict['output_dids'][fileRow['file_did']]['size_bytes']
-        seconds   = jsonDict['output_dids'][fileRow['file_did']]['seconds']
+        rseName = jsonDict['output_files'][fileName]['rse_name']
+      except:
+        rseName = None
+
+      try:
+        sizeBytes = jsonDict['output_files'][fileName]['size_bytes']
+        seconds   = jsonDict['output_files'][fileName]['seconds']
       except:
         sizeBytes = 0
         seconds   = 0.0
-        rseName   = None
       
       justin.insertUpdate('UPDATE files SET state="%s",size_bytes=%d '
                           'WHERE file_id=%d' %
@@ -1809,62 +2198,81 @@ def confirmResultsMethod(startResponse, jsonDict):
                           sizeBytes,
                           fileRow['file_id']))
 
+      justin.insertUpdate('UPDATE stages_outputs '
+                          'SET number_files=number_files+1 '
+                          'WHERE workflow_id=%d AND stage_id=%d '
+                          'AND pattern_id=%d' % 
+                          (workflowID, stageID, fileRow['creator_pattern_id']))
+
       justin.logEvent(eventTypeID = justin.event_FILE_CREATED,
                       workflowID = workflowID,
                       stageID = stageID,
                       fileID = fileRow['file_id'],
                       justinJobID = justinJobID,
                       siteID = siteID,
+                      entryID = entryID,
                       rseName = rseName,
                       seconds = seconds
                      )
+
     except Exception as e:
       return httpError(startResponse,
                        '500 Internal Server Error',
                        'Updating recorded output file: ' + str(e))
+  try:
+    numProcessedRow = justin.select('SELECT '
+             '(SELECT sent_get_file FROM jobs WHERE justin_job_id=%d) '
+             'AS sent_get_file,'
+             '(SELECT COUNT(*) FROM events WHERE '
+             'events.justin_job_id=%d AND '
+             'events.event_type_id=%d) AS num_processed,'
+             '(SELECT COUNT(*) FROM events WHERE '
+             'events.justin_job_id=%d AND '
+             'events.event_type_id=%d) AS num_allocated'
+             % (justinJobID,
+                justinJobID, justin.event_FILE_PROCESSED,
+                justinJobID, justin.event_FILE_ALLOCATED),
+                                    justOne = True)
+    sentGetFile  = bool(numProcessedRow['sent_get_file'])
+    numProcessed = numProcessedRow['num_processed']
+    numAllocated = numProcessedRow['num_allocated']
+  except Exception as e:
+    return httpError(startResponse,
+                     '500 Internal Server Error', 
+                     'Failed to count FILE_PROCESSED events: ' + str(e))
 
-  # Record output files uploaded directly to scratch etc
-  for url in jsonDict['output_urls']:
-    if not justin.stringNoQuotes(url):
-      return httpError(startResponse, '400 Bad Request', 'Bad URL for upload')
-
-    try:
-      file_id = justin.insertUpdate('INSERT INTO files SET '
-                                    'state="output",'
-                                    'workflow_id=%d,'
-                                    'stage_id=0,'
-                                    'file_did="%s",'
-                                    'creator_justin_job_id=%d'
-                                    % (workflowID, 
-                                       url,
-                                       justinJobID))
-
-      justin.logEvent(eventTypeID = justin.event_FILE_UPLOADED,
-                         workflowID = workflowID,
-                         stageID = stageID,
-                         fileID = file_id,
-                         justinJobID = justinJobID,
-                         siteID = siteID
-                        )
-
-    except Exception as e:
-      return httpError(startResponse,
-                       '500 Internal Server Error', 
-                       'Recording output file uploaded by url: ' + str(e))
+  if 'created_dataset_dids' in jsonDict:
+    for datasetDID in jsonDict['created_dataset_dids']:
+      try:
+        justin.insertUpdate('INSERT IGNORE INTO workflows_datasets '
+                            'SET workflow_id=%d,stage_id=%d,'
+                            'dataset_did="%s"' 
+                            % (workflowID, stageID, datasetDID))
+      except Exception as e:
+        # Carry on if there are errors: jobs will retry creation/reporting
+        print('Failed inserting dataset: ' + str(e), file=sys.stderr)
 
   # Finish up and update job status
   try:
-    justin.insertUpdate('UPDATE jobs SET job_state="finished",'
+    # Jobs only finish in the none_processed state if any files were allocated
+    # or if they never even asked for any, but not for AWT jobs
+    justin.insertUpdate('UPDATE jobs SET job_state="%s",'
                         'heartbeat_time=NOW(),'
                         'finished_time=NOW() '
                         'WHERE justin_job_id=%d AND job_state="outputting"'
-                        % justinJobID)
+                        % ('none_processed'
+                           if ((numProcessed==0 and numAllocated) 
+                           or not sentGetFile) 
+                           and (workflowID != justin.awtWorkflowID)
+                           else 'finished',
+                           justinJobID))
 
     justin.logEvent(eventTypeID = justin.event_JOB_FINISHED,
                     workflowID = workflowID,
                     stageID = stageID,
                     justinJobID = justinJobID,
-                    siteID = siteID
+                    siteID = siteID,
+                    entryID = entryID
                    )
   except:
     return httpError(startResponse, 
@@ -1948,6 +2356,8 @@ def application(environ, startResponse):
   print('Call count (pid=%d): %d' % (os.getpid(), justin.wsgiCallsCount), 
         file=sys.stderr)
 
+  justin.readConf()
+
   # Quickly reject random GETs etc (if not handled by Apache already)
   if environ['REQUEST_METHOD'] != 'POST':
     return httpError(startResponse,
@@ -1968,8 +2378,8 @@ def application(environ, startResponse):
   # and reset autocommit
   justin.conn.rollback()
   justin.conn.autocommit(False)
-#  row = justin.select('SELECT @@autocommit', justOne = True)
-#  print('autocommit=' + str(row), file=sys.stderr)
+
+  justin.checkProxyStrings()
 
   if environ['REQUEST_URI'].startswith('/api/get-classads'):
     return getClassadsCall(startResponse, environ)
@@ -2037,6 +2447,9 @@ def application(environ, startResponse):
     jobState = checkSecretHash(environ, jsonDict)
   except Exception as e:
     return httpError(startResponse, '403 Forbidden', str(e))
+
+  if jobState == 'stalled':
+    return httpError(startResponse, '403 Forbidden', 'Cannot update stalled jobs')
 
   # Get the details of the stage for the job to work on
   if jsonDict['method'] == 'get_jobscript':

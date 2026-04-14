@@ -1,5 +1,5 @@
 #
-# Copyright 2013-23, Andrew McNab for the University of Manchester
+# Copyright 2013-25, Andrew McNab for the University of Manchester
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,17 +15,21 @@
 #
 
 from justin.justin_version import *
-__all__ = [ 'justin_version' ]
+from justin.events_list import *
+__all__ = [ 'justin_version', 'events_list' ]
 
 import os
 import io
 import re
+import pwd
 import sys
 import time
 import json
+import socket
 import random
 import string
 import tarfile
+import rucio.client
 import configparser
 
 #import MySQLdb
@@ -44,10 +48,12 @@ jobsProductionProxyFile   = '/tmp/justin-jobs-production.proxy.pem'
 jobsNoRolesProxyString = None
 jobsNoRolesProxyFile   = '/tmp/justin-jobs-no-roles.proxy.pem'
 
-# Constantas
-MonteCarloRseID = 1
-
-justinRunDir    = '/var/run/justin'
+# Constants
+MonteCarloRseID     = 1
+justinRunDir        = '/var/run/justin'
+rucioProductionUser = 'dunepro'
+productionDN = \
+ '/C=UK/O=eScience/OU=Manchester/L=HEP/CN=justin-jobs-production.dune.hep.ac.uk'
 
 # From justin.conf etc
 mysqlUsername   = None
@@ -59,10 +65,24 @@ cilogonClientID     = None
 cilogonSecret       = None
 wlcgGroups          = None
 justinAdmins        = None
-rucioProductionUser = None
+justinJobsUser      = None
 agentUsername       = None
-proDev              = None
+instance            = None
+dashboardURL        = None
 htcondorSchedds     = None
+htcondorCollectors  = None
+keepWrapperFiles    = None
+extraEntries        = None
+
+metacatAuthServerURL    = None
+metacatServerInputsURL  = None
+metacatServerOutputsURL = None
+
+awtWorkflowID = None
+
+bannerMessage = None
+
+rcdsServers = None
 
 ## Global database connection
 conn = None
@@ -85,6 +105,11 @@ htcondorHELD                = 5
 htcondorTRANSFERRING_OUTPUT = 6
 htcondorSUSPENDED           = 7
 
+cilogonScopes       = ('openid profile org.cilogon.userinfo '
+                       'wlcg.capabilityset:/duneana wlcg.groups:/dune '
+                       'wlcg.groups:/dune/production '
+                       'wlcg.groups:/dune/lowenergy')
+
 # Note that this assumes we are using UTC since we assume elsewhere this
 # will convert from this MySQL date to 0 in Unix seconds
 # Also Unicode date strings coming out of MySQL may not match plain strings 
@@ -98,19 +123,35 @@ unseenSitesExpireDays = 7
 # Set in configuration, default 0.5
 nonJustinFraction = None
 
+# When rucio ping takes this many seconds, assume Rucio is overloaded
+# and back off job submissions and jobscript starts
+overloadRucioMilliseconds = None
+
 # Timeout is when to update cached ranks; Stale is when to remove from Finder
 sitesRankCacheTimeout = 300
 sitesRankCacheStale   = 3600
 
+workflowStates = [ 'draft','submitted','approved','running',
+                   'paused','checking','finished','deleted']
+
 jobStatesTerminal = [ 'finished', 'notused', 'aborted', 'stalled', 
-                      'jobscript_error', 'outputting_failed' ]
+                      'jobscript_error', 'outputting_failed', 'none_processed' ]
 
 jobStatesAll = [ 'submitted', 'started', 'processing', 'outputting' ] \
                + jobStatesTerminal
 
 jobStallSeconds = 3660
+maxFilesPerJob  = 20
+parallelJobLogs = None
+
+filesPerNumberedDestination = 1000
 
 defaultScopeName = 'usertests'
+
+wrapperJobImage       = None
+jobscriptImageSuffix  = None
+jobscriptImagePrefix  = None 
+jobscriptImageVersion = None 
 
 rseCountriesRegions = { 
                         'BR'  : 'South_America',
@@ -129,148 +170,28 @@ rseCountriesRegions = {
                         'US'  : 'North_America'
                       }
 
-awtWorkflowID = 1
-awtFileID     = 1
-
-maxAllocations = 6
-
 # Catch all events
 event_UNDEFINED = 0
+eventTypes = { event_UNDEFINED : ['UNDEFINED', 'Undefined'] }
 
-# Workflow Allocator events
-# DEPRECATED: DO NOT USE NOW!!!
-#old_event_HEARTBEAT_RECEIVED  = 100
-#old_event_GET_STAGE_RECEIVED  = 101
-#old_event_STAGE_ALLOCATED     = 102
-#old_event_FILE_ALLOCATED      = 103
-#old_event_OUTPUTTING_RECEIVED = 104
-#old_event_CONFIRM_RECEIVED    = 105
+# Go through eventsList defining variables and adding to dictionary
+# So we can say justin.event_AWT_READ_OK etc in the code elsewhere
+for (eventLabel, eventID, eventText) in eventsList:
+  exec('event_%s=%d' % (eventLabel, eventID))
+  exec('eventTypes[event_%s]=["%s","%s"]' % (eventLabel,eventLabel,eventText))
 
-# Finder events
-#event_FILE_ADDED                = 201
-event_REPLICA_ADDED             = 202
-event_REPLICA_STAGING_REQUESTED = 203
-event_REPLICA_STAGING_DONE      = 204
-event_REPLICA_STAGING_CANCELLED = 205
-
-# Job events
-event_JOB_SUBMITTED		= 301
-event_JOB_STARTED		= 302
-event_JOB_PROCESSING		= 303
-event_JOB_OUTPUTTING		= 304
-event_JOB_FINISHED		= 305
-event_JOB_NOTUSED		= 306
-event_JOB_ABORTED		= 307
-event_JOB_STALLED_HEARTBEAT	= 308
-event_JOB_SCRIPT_ERROR          = 309
-event_JOB_OUTPUTTING_FAILED     = 310
-event_JOB_STALLED_HTCONDOR	= 311
-
-# File events
-event_FILE_ADDED                = 201
-#event_FILE_ADDED                = 400
-#event_FILE_ALLOCATED            = 103
-event_FILE_ALLOCATED            = 401
-event_FILE_ALLOCATED_RESET      = 402
-event_FILE_SET_TO_FAILED        = 403
-event_FILE_CREATED              = 404
-event_FILE_OUTPUTTING_RESET     = 405
-event_FILE_UPLOADED             = 406
-
-# AWT events 
-event_AWT_READ_OK               = 501
-event_AWT_READ_FAIL             = 502
-event_AWT_WRITE_OK              = 503
-event_AWT_WRITE_FAIL            = 504
-
-eventTypes = { 
- 
- # Catch all events
- event_UNDEFINED       : ['UNDEFINED',       'Undefined'],
-
- # Workflow Allocator events (DEPRECATED)
-# old_event_HEARTBEAT_RECEIVED : ['HEARTBEAT_RECEIVED', 
-#                             'Heartbeat received by allocator'],
-# old_event_GET_STAGE_RECEIVED : ['GET_STAGE_RECEIVED', 
-#                             'get_stage received from job by allocator'],
-# old_event_STAGE_ALLOCATED    : ['STAGE_ALLOCATED', 
-#                             'Stage allocated to job'],
-# old_event_FILE_ALLOCATED     : ['FILE_ALLOCATED',  
-#                             'File allocated to job'],
-# old_event_OUTPUTTING_RECEIVED : ['OUTPUTTING_RECEIVED',
-#                             'Outputting state received from job by allocator'],
-# old_event_CONFIRM_RECEIVED   : ['CONFIRM_RECEIVED',
-#                             'Confirmation received from job by allocator'],
-
-# SHOULD REPLACE WITH SOMETHING DYNAMIC USING exec() TO AVOID DUPLICATION
-# OF NAMES?
-
- # Replica events
- event_REPLICA_ADDED             : ['REPLICA_ADDED',
-                                    'Replica added for file by finder'],
- event_REPLICA_STAGING_REQUESTED : ['REPLICA_STAGING_REQUESTED',
-                                    'Finder workflows replica staging'],
- event_REPLICA_STAGING_DONE      : ['REPLICA_STAGING_DONE',
-                                    'Replica staging workflowed by finder done'],
- event_REPLICA_STAGING_CANCELLED : ['REPLICA_STAGING_CANCELLED',
-                                    'Replica staging cancelled by finder'],
-
- # Job events               
- event_JOB_SUBMITTED    : ['JOB_SUBMITTED',
-                           'Job submitted by factory'],
- event_JOB_STARTED      : ['JOB_STARTED',
-                           'Job started running at site'],
- event_JOB_PROCESSING   : ['JOB_PROCESSING',
-                           'Job began processing files'],
- event_JOB_OUTPUTTING   : ['JOB_OUTPUTTING',
-                           'Job began outputting files to storage'],
- event_JOB_FINISHED     : ['JOB_FINISHED',
-                           'Job finished'],
- event_JOB_NOTUSED      : ['JOB_NOTUSED',
-                           'Job was not allocated a stage'],
- event_JOB_ABORTED      : ['JOB_ABORTED',
-                           'Job aborted'],
- event_JOB_STALLED_HEARTBEAT : ['JOB_STALLED_HEARTBEAT',
-                                'Job stalls with missing heartbeats'],
- event_JOB_SCRIPT_ERROR : ['JOB_SCRIPT_ERROR',
-                           'Error raised by the jobscript'],
- event_JOB_OUTPUTTING_FAILED : ['JOB_OUTPUTTING_FAILED',
-                                'Job outputting failed'],
- event_JOB_STALLED_HTCONDOR : ['JOB_STALLED_HTCONDOR',
-                               'Job stalls as absent from HTCondor'],
-
- # File events
- event_FILE_ADDED            : ['FILE_ADDED',
-                                'File added to first stage by finder'],
- event_FILE_ALLOCATED        : ['FILE_ALLOCATED',  
-                                'File allocated to job'],
- event_FILE_ALLOCATED_RESET  : ['FILE_ALLOCATED_RESET',
-                                'File set back to unallocated from allocated'],
- event_FILE_SET_TO_FAILED    : ['FILE_SET_TO_FAILED',
-                                'Too many attempts to process file: failed'],
- event_FILE_CREATED          : ['FILE_CREATED',
-                                'Output file created in job'],
- event_FILE_OUTPUTTING_RESET : ['FILE_OUTPUTTING_RESET',
-                                'File set back to unallocated from outputting'],
- event_FILE_UPLOADED          : ['FILE_UPLOADED',
-                                'Output file uploaded in job'],
-
- # AWT events
- event_AWT_READ_OK     : ['AWT_READ_OK',
-                          'AWT read test succeeds'],
- event_AWT_READ_FAIL   : ['AWT_READ_FAIL',
-                          'AWT read test fails'],
- event_AWT_WRITE_OK    : ['AWT_WRITE_OK',
-                          'AWT write test succeeds'],
- event_AWT_WRITE_FAIL  : ['AWT_WRITE_FAIL',
-                          'AWT write test fails']
-             }
 
 def readConf():
   global mysqlUsername, mysqlPassword, mysqlHostname, mysqlDbName, \
          cilogonClientID, cilogonSecret, agentUsername,  \
-         proDev, wlcgGroups, rucioProductionUser, justinAdmins, \
-         nonJustinFraction, htcondorSchedds
+         instance, dashboardURL, wlcgGroups, justinJobsUser, justinAdmins, \
+         nonJustinFraction, htcondorSchedds, htcondorCollectors, \
+         metacatAuthServerURL, \
+         metacatServerInputsURL, metacatServerOutputsURL, \
+         jobscriptImagePrefix, jobscriptImageSuffix, jobscriptImageVersion, \
+         wrapperJobImage, overloadRucioMilliseconds, \
+         awtWorkflowID, bannerMessage, rcdsServers, keepWrapperFiles, \
+         extraEntries, parallelJobLogs
 
   parser = configparser.RawConfigParser()
 
@@ -291,6 +212,12 @@ def readConf():
   # Options for the [database] section
 
   try:
+    instance = parser.get('database','instance').strip()
+  except:
+    # In case of misconfiguration, the default is dev
+    instance = 'dev'
+
+  try:
     mysqlUsername = parser.get('database','username').strip()
   except:
     mysqlUsername = 'dunejustin'
@@ -298,7 +225,8 @@ def readConf():
   try:
     mysqlHostname = parser.get('database','hostname').strip()
   except:
-    mysqlHostname = 'justin-db-pro.dune.hep.ac.uk'
+    # In case of misconfiguration, the default is dev
+    mysqlHostname = 'justin-db-dev.dune.hep.ac.uk'
 
   try:
     mysqlPassword = parser.get('database','password').strip()
@@ -343,9 +271,9 @@ def readConf():
     justinAdmins = []
 
   try:
-    rucioProductionUser = parser.get('users','rucio_production_user').strip()
+    justinJobsUser = parser.get('users','justin_jobs_user').strip()
   except:
-    rucioProductionUser = 'dunepro'
+    justinJobsUser = 'dunepro'
 
   # Options for the [agents] section
 
@@ -355,15 +283,52 @@ def readConf():
     agentUsername = 'dunejustin'
 
   try:
-    proDev = parser.get('agents','pro_dev').strip()
+    overloadRucioMilliseconds = int(
+                 parser.get('agents','overload_rucio_milliseconds').strip())
   except:
-    proDev = 'pro'
+    overloadRucioMilliseconds = 100000
 
   try:
     nonJustinFraction = float(
                          parser.get('agents','non_justin_fraction').strip())
   except:
     nonJustinFraction = 0.5
+
+  try:
+    wrapperJobImage = parser.get('agents',
+                                 'wrapper_job_image').strip()
+  except:
+    wrapperJobImage = \
+      '/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest'
+
+  # Default apptainer image in cvmfs is 'prefix/suffix:latest'
+  try:
+    jobscriptImagePrefix = parser.get('agents',
+                                      'jobscript_image_prefix').strip()
+  except:
+    jobscriptImagePrefix = '/cvmfs/singularity.opensciencegrid.org/fermilab'
+
+  try:
+    jobscriptImageSuffix = parser.get('agents',
+                                      'jobscript_image_suffix').strip()
+  except:
+    jobscriptImageSuffix = 'fnal-wn-sl7'
+
+  try:
+    jobscriptImageVersion = parser.get('agents',
+                                       'jobscript_image_version').strip()
+  except:
+    jobscriptImageVersion = 'latest'
+
+  try:
+    awtWorkflowID = int(parser.get('agents','awt_workflow_id').strip())
+  except:
+    awtWorkflowID = 1
+
+  try:
+    parallelJobLogs = int(parser.get('agents','parallel_job_logs').strip())
+  except:
+    parallelJobLogs = 10
 
   try:
     a = parser.get('htcondor','schedds').strip()
@@ -373,82 +338,217 @@ def readConf():
         raise 
       htcondorSchedds.append(a.strip().lower())
   except:
-    htcondorSchedds = [ 'justin-prod-sched01.dune.hep.ac.uk' ]
+    htcondorSchedds = [ 'justin-prod-sched01.dune.hep.ac.uk',
+                        'justin-prod-sched02.dune.hep.ac.uk' ]
 
-# Try to find the text of a jobscript from the Jobscripts Library 
-# given a JSID
-def lookupJobscript(jsid):
-  if ':' not in jsid:
-    return { 'error': 'Jobscript identifier must contain ":"' }
-
-  (prefix,name) = jsid.split(':',1)
-
-  if not prefix or not name:
-    return { 'error': 'Both parts of the JSID must be given' }
-
-  if not stringIsDomain(name):
-    return { 'error': 'Invalid characters in jobscript name in JSID' }
-
-  if '@' in prefix:
-    # JSID is USER:NAME
-
-    if not stringIsUsername(prefix):
-      return { 'error': 'Invalid characters in user name in JSID' }
-
-    query = ('SELECT jobscripts_library.description,'
-             'authors_principals.principal_name AS authorname,'
-             'created_time,jobscript,jobscript_id '
-             'FROM jobscripts_library '
-             'LEFT JOIN users AS authors '
-             'ON jobscripts_library.author_id=authors.user_id '
-             'LEFT JOIN principal_names AS authors_principals '
-             'ON authors.main_pn_id=authors_principals.pn_id '
-             'LEFT JOIN users AS jobscripts_users '
-             'ON jobscripts_library.user_id=jobscripts_users.user_id '
-             'LEFT JOIN principal_names AS users_principals '
-             'ON jobscripts_users.main_pn_id=users_principals.pn_id '
-             'WHERE users_principals.principal_name="%s" '
-             'AND jobscript_name="%s"'
-             % (prefix, name))
-  else:
-    # JSID is SCOPE:NAME
-
-    if not stringIsDomain(prefix):
-      return { 'error': 'Invalid characters in scope name in JSID' }
-
-    query = ('SELECT jobscripts_library.description,'
-             'authors_principals.principal_name AS authorname,'
-             'created_time,jobscript,jobscript_id '
-             'FROM jobscripts_library '
-             'LEFT JOIN users AS authors '
-             'ON jobscripts_library.author_id=authors.user_id '
-             'LEFT JOIN principal_names AS authors_principals '
-             'ON authors.main_pn_id=authors_principals.pn_id '
-             'LEFT JOIN scopes '
-             'ON jobscripts_library.scope_id=scopes.scope_id '
-             'WHERE scope_name="%s" AND jobscript_name="%s"'
-             % (prefix, name))
   try:
-    jobscriptRow = select(query, justOne = True)
-  except Exception as e:
-    return { 'error': 'Query to justIN failed: ' + str(e) }
+    a = parser.get('htcondor','collectors').strip()
+    htcondorCollectors = []
+    for a in a.split():
+      if not stringIsDomain(a):
+        raise 
+      htcondorCollectors.append(a.strip().lower())
+  except:
+    htcondorCollectors = [ 'dunegpcoll01.fnal.gov',
+                           'dunegpcoll02.fnal.gov' ]
 
-  if not jobscriptRow or not jobscriptRow['jobscript']:
-    return { 'error': 'Jobscript %s not found' % jsid }   
+  try:
+    keepWrapperFiles = bool(parser.get('htcondor','keep_wrapper_files').strip())
+  except:
+    keepWrapperFiles = False
 
-  return { 'jobscript'    : jobscriptRow['jobscript'],
-           'jobscript_id' : jobscriptRow['jobscript_id'],
-           'description'  : jobscriptRow['description'],
-           'authorname'   : jobscriptRow['authorname'],
-           'created_time' : jobscriptRow['created_time'],           
-           'error'        : None }
+  try:
+    extraEntries = parser.items('extra_entries')
+  except:
+    extraEntries = []
+  
+  try:
+    metacatAuthServerURL = parser.get('metacat','auth_server_url').strip()
+  except:
+    metacatAuthServerURL = 'https://metacat.fnal.gov:8143/auth/dune'
 
+  try:
+    metacatServerInputsURL =parser.get('metacat','server_inputs_url').strip()
+  except:
+    metacatServerInputsURL ='https://metacat.fnal.gov:9443/dune_meta_prod/app'
+
+  try:
+    metacatServerOutputsURL =parser.get('metacat','server_outputs_url').strip()
+  except:
+    metacatServerOutputsURL ='https://metacat.fnal.gov:9443/dune_meta_prod/app'
+
+  # Dashboard
+  try:
+    bannerMessage = parser.get('dashboard', 'banner_message').strip()
+  except:
+    bannerMessage = ''
+
+  try:
+    # URL of dashboard without trailing space
+    dashboardURL = parser.get('dashboard', 'url').strip()
+    
+    if dashboardURL[-1] == '/':
+      dashboardURL = dashboardURL[:-1]
+  except:
+    dashboardURL = 'https://justin-%s.dune.hep.ac.uk' % instance
+
+  # FNAL Agent
+  try:
+    rcdsServers = parser.get('fnal_agent', 'rcds_servers').strip().split()
+  except:
+    rcdsServers = ['rcds01.fnal.gov']
+
+def logLine(text):
+  sys.stdout.write(time.strftime('%b %d %H:%M:%S [') + str(os.getpid())
+                   + ']: ' + text + '\n')
+  sys.stdout.flush()
+
+def agentMainLoop(agentName, oneCycle, sleepSeconds, maxCycleSeconds):
+
+  global conn, cur
+
+  os.chdir("/")
+  os.umask(0)
+
+  try:
+    os.makedirs(justinRunDir + '/last-updates',
+                stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | 
+                stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+  except:
+    pass
+        
+  try:
+    f = open('%s/%s.pid' % (justinRunDir, agentName), 'w')
+    f.write(str(os.getpid()) + '\n')
+    f.close()
+  except:
+    print('Failed to create %s/%s.pid - exiting'
+           % (justinRunDir, agentName))
+    sys.exit(1)
+
+  # Close stdin now
+  si = open('/dev/null', 'r')
+  os.dup2(si.fileno(), sys.stdin.fileno())
+
+  while True:
+
+    # Ensure /var/log/justin directory exists
+    try:
+      os.makedirs('/var/log/justin', 
+                  stat.S_IRUSR|stat.S_IWUSR|stat.S_IXUSR|stat.S_IRGRP
+                  |stat.S_IXGRP|stat.S_IROTH|stat.S_IXOTH)
+    except:
+      pass
+
+    # Close and reopen stdout->log file, in case of logrotate
+    try:
+      close(so)
+    except:
+      pass
+
+    so = open('/var/log/justin/%s' % agentName, 'a+')
+    os.dup2(so.fileno(), sys.stdout.fileno())
+
+    # Close and reopen stderr->log file, in case of logrotate
+    try:
+      close(se)
+    except:
+      pass
+          
+    se = open('/var/log/justin/%s' % agentName, 'a+')
+    os.dup2(se.fileno(), sys.stderr.fileno())
+
+    try:
+      pf = open('%s/%s.pid' % (justinRunDir, agentName), 'r')
+      pid = int(pf.read().strip())
+      pf.close()
+
+      if pid != os.getpid():
+        print('new %s/%s.pid - exiting' % (justinRunDir, agentName))
+        break
+
+    except:
+      print('no %s/%s.pid - exiting' % (justinRunDir, agentName))
+      break
+
+    # Fork a subprocess to run each cycle
+    cyclePid = os.fork()
+
+    if cyclePid == 0:
+      logLine('=============== Start cycle ===============')
+          
+      readConf()
+
+      try:
+        logLine('/proc/loadavg: ' + open('/proc/loadavg','r').read().strip())
+      except:
+        pass
+          
+      try:
+        conn = MySQLdb.connect(
+                         host   = socket.gethostbyname(mysqlHostname),
+                         user   = mysqlUsername,
+                         passwd = mysqlPassword,
+                         db     = mysqlDbName)
+        conn.autocommit(False)
+        cur = conn.cursor(MySQLdb.cursors.DictCursor)
+      except Exception as e:
+        logLine('Failed to create database connection (' + 
+                    str(e) + ') - skipping cycle')
+      else:
+        try:
+          p = pwd.getpwnam(agentUsername)
+          os.chown(justinRunDir + '/last-updates', p[2], p[3])
+          os.setgid(p[3])
+          os.setuid(p[2])
+          oneCycle()
+        except Exception as e:
+          print('Cycle fails with exception ' + str(e))
+
+        conn.close()
+
+      logLine('================ End cycle ================')
+      # The subprocess is only used for this one cycle
+      sys.exit(0)
+
+    for count in range(0, maxCycleSeconds + 60, 60):
+      if pidIsActive(cyclePid):
+        time.sleep(60)
+      else:
+        break
+
+    if pidIsActive(cyclePid):
+      # subprocess still running despite reaching maxCycleSeconds so kill it
+      print('PID %d is still running after %d seconds - kill it' 
+            % (cyclePid, maxCycleSeconds))
+      try:
+        os.kill(cyclePid)
+      except Exception:
+        logLine('Kill of %d fails with: %s' % (cyclePid, str(e)))
+   
+      try:
+        # Clear zombie state subprocess by reading outcome
+        os.waitpid(cyclePid, 0)
+      except:
+        pass
+
+    # wait the allotted time between cycles
+    time.sleep(sleepSeconds)
+
+  sys.exit(0) # if we break out of the while loop then we exit
 
 def stringIsJobsubID(s):
   return re.search('[^A-Za-z0-9_.@-]', s) is None
 
 def stringIsUsername(s):
   return re.search('[^a-z0-9_.@-]', s) is None
+
+# What characters are valid? Same as File for now
+def stringIsScope(s):
+  return re.search('[^A-Za-z0-9_.-]', s) is None
+
+def stringIsFile(s):
+  return re.search('[^A-Za-z0-9_.-]', s) is None
 
 def stringIsFilePattern(s):
   return re.search('[^*A-Za-z0-9_.-]', s) is None
@@ -457,7 +557,11 @@ def stringIsURL(s):
   return re.search('[^/A-Za-z0-9_.:-]', s) is None
 
 def stringIsDID(s):
-  return re.search('[^a-z0-9_.:-]', s) is None
+  return re.search('[^A-Za-z0-9_.:-]', s) is None
+
+# RSE Expression
+def stringIsExpression(s):
+  return re.search('[^A-Za-z0-9_&=|()\<> -]', s) is None
 
 def stringIsDomain(s):
   return re.search('[^A-Za-z0-9.-]', s) is None
@@ -471,6 +575,21 @@ def stringIsEnvName(s):
 def stringNoQuotes(s):
   return re.search('["`\']', s) is None
 
+def bytesToUnits(bytes):
+  if bytes < 1000*1000:
+    return "%.1f KB" % (bytes/1000.0)
+  
+  if bytes < 1000*1000*1000:
+    return "%.1f MB" % (bytes/1000000.0)
+  
+  if bytes < 1000*1000*1000*1000:
+    return "%.1f GB" % (bytes/1000000000.0)
+  
+  if bytes < 1000*1000*1000*1000*1000:
+    return "%.1f TB" % (bytes/1000000000000.0)
+
+  return "%.1f PB" % (bytes/1000000000000000.0)
+  
 # Use os.path.expandvars() to replace environment variables from dictionary envs
 def expandEnvVars(s, envs):
   savedEnviron = dict(os.environ)
@@ -491,12 +610,16 @@ def expandEnvVars(s, envs):
 # errors. You must ensure events are committed along with anything else
 # you are writing to the database!!!
 def logEvent(eventTypeID = event_UNDEFINED,
+             campaignID = 0,
              workflowID = 0,
              stageID = 0,
              fileID = 0,
              justinJobID = 0,
+             jobscriptExit = 0,
              siteID = 0,
              siteName = None,
+             entryID = 0,
+             entryName = None,
              rseID = 0,
              rseName = None,
              seconds = 0.0):
@@ -507,6 +630,12 @@ def logEvent(eventTypeID = event_UNDEFINED,
   else:
     siteExpr = str(siteID)
 
+  if entryName:
+    entryExpr = ('(SELECT entry_id FROM entries WHERE entries.entry_name="%s")' 
+                % entryName)
+  else:
+    entryExpr = str(entryID)
+
   if rseName:
     rseExpr = ('(SELECT rse_id FROM storages WHERE storages.rse_name="%s")' 
                 % rseName)  
@@ -516,20 +645,26 @@ def logEvent(eventTypeID = event_UNDEFINED,
   try:
     query = ('INSERT INTO events SET '
              'event_type_id=%d,'
+             'campaign_id=%d,'
              'workflow_id=%d,'
              'stage_id=%d,'
              'file_id=%d,'
              'justin_job_id=%d,'
+             'jobscript_exit=%d,'
              'site_id=%s,'
+             'entry_id=%s,'
              'rse_id=%s,'
              'seconds=%.3f,'
              'event_time=NOW()' %
              (eventTypeID,
+              campaignID,
               workflowID,
               stageID,
               fileID,
               justinJobID,
+              jobscriptExit,
               siteExpr,
+              entryExpr,
               rseExpr,
               seconds))
 
@@ -564,7 +699,7 @@ def select(query, justOne = False, tries = 10, showQuery = False):
     else:
       # Success! Return the results!
       if justOne:
-        # fetchone() returns None of no matching rows were found
+        # fetchone() returns None of no matching rows were found
         return cur.fetchone()
       else:
         return cur.fetchall()
@@ -631,3 +766,51 @@ def fixPfn(pfn):
     pfn = pfn.replace(old, new)
     
   return pfn
+
+def checkProxyStrings():
+  global jobsNoRolesProxyString, jobsProductionProxyString
+  
+  try:
+    with open(jobsNoRolesProxyFile, 'rb') as f:
+      jobsNoRolesProxyString = f.read()
+  except Exception as e:
+    print('Failed loading X.509 proxy from %s : %s'
+          % (jobsNoRolesProxyFile, str(e)), file=sys.stderr)
+
+  try:
+    with open(jobsProductionProxyFile, 'rb') as f:
+      jobsProductionProxyString = f.read()
+  except Exception as e:
+    print('Failed loading X.509 proxy from %s : %s'
+          % (jobsProductionProxyFile, str(e)), file=sys.stderr)
+
+
+# Check if a process is still active
+# Linux specific but avoids installing psutil
+def pidIsActive(pid):
+
+  try:
+    statList = open('/proc/%d/stat' % pid).read().split()
+  except:
+    return False
+
+  if statList[2] in ['R', 'S', 'D']:
+    return True
+    
+  return False
+
+
+# Return the Rucio ping milliseconds 
+def pingRucioMilliseconds():
+
+  pingClient = rucio.client.pingclient.PingClient()
+  startTime  = time.time()
+  for i in range(0,3):
+    try:
+      pingDict = pingClient.ping()  
+    except Exception as e:
+      logLine('Rucio ping fails with exception ' + str(e))
+      return 99999
+  endTime    = time.time()
+  
+  return int((endTime - startTime) * 333.333)

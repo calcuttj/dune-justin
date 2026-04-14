@@ -2,7 +2,7 @@
 This man page is distributed along with the 
 justin-cvmfs-upload command itself.
 
-    JUSTIN(2023)							  JUSTIN(2023)
+    JUSTIN(2024)							  JUSTIN(2024)
     
     NAME
            justin-cvmfs-upload - upload files to cvmfs via RCDS for justIN
@@ -11,13 +11,17 @@ justin-cvmfs-upload command itself.
            justin-cvmfs-upload [--help] [--verbose] TAR_FILE
     
     DESCRIPTION
-           justin-cvmfs-upload is a command-line utility for upload one or more
+           justin-cvmfs-upload is a command-line utility for uploading one or more
            files contained in a tar archive file to cvmfs using the Fermilab Rapid
            Code Distribution Service (RCDS). The full cvmfs path is then output by
-           the command.
+           the command. Files should persist in cvmfs for 30 days but it is good
+           practice to rerun the command before each workflow that uses it is
+           submitted. The hash of the tar file is used to avoid transferring the
+           tar file if RCDS is already aware of it.
     
-           The environment variable JOBSUB_DROPBOX_SERVER_LIST is used to find the
-           RCDS server to use, or rcds01.fnal.gov if the variable is not set.
+           The environment variable JOBSUB_DROPBOX_SERVER_LIST is used to find a
+           random RCDS server to use, or rcds01.fnal.gov if the variable is not
+           set.
     
     
     OPTIONS AND ARGUMENTS
@@ -36,9 +40,12 @@ justin-cvmfs-upload command itself.
     
     EXAMPLE
            justin-cvmfs-upload must be run on a computer inside the Fermilab
-           firewall. You also need a valid X.509 proxy, which you can readily
-           create with the kx509 commnad. A VOMS proxy is not needed.
+           firewall. You also need a valid Bearer Token at $BEARER_TOKEN_FILE if
+           set or /run/users/UID/bt_uUID if it exists or /tmp/bt_uUID in other
+           cases, where UID is your local Unix user ID, which you can create with
+           the command justin get-token
     
+           htgettoken -a htvaultprod.fnal.gov -i dune
            mkdir somedir
            cd somedir
            date > hello_world.txt
@@ -54,4 +61,4 @@ justin-cvmfs-upload command itself.
     SEE ALSO
            justin(1)
     
-    justIN Manual		      justin-cvmfs-upload		  JUSTIN(2023)
+    justIN Manual		      justin-cvmfs-upload		  JUSTIN(2024)

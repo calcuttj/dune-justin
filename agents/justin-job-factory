@@ -2,7 +2,7 @@
 #
 # justin-job-factory - justIN Job Factory
 #
-# Copyright 2013-24, Andrew McNab for the University of Manchester
+# Copyright 2013-25, Andrew McNab for the University of Manchester
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import secrets
 import pathlib
 import tempfile
 import subprocess
+import rucio.client
 
 ## Needs MySQL-python RPM
 #import MySQLdb
@@ -76,6 +77,7 @@ def logLine(text):
 def submitJobs(numberToSubmit,
                userName,
                needsInnerApptainer,
+               jobscriptImage,
                accountingGroup,
                workflowID,
                stageID,
@@ -85,16 +87,18 @@ def submitJobs(numberToSubmit,
                desiredEntryNames,
                requestedProcessors,
                requestedRssBytes,
-               requestedWallSeconds):
+               requestedWallSeconds,
+               requestedGPU):
 
   # If targetting one site, then firstSiteID should be non-zero
   # desiredSiteNames is a comma separated list of jobsub style site names
   # to match GLIDEIN_Site classads and xc`others used by GlideInWMS
 
-  logLine('submitJobs %d %s %s %s w%ds%d %d %s %s %s %d %d %d' %
+  logLine('submitJobs %d %s %s %s %s w%ds%d %d %s %s %s %d %d %d %d' %
           (numberToSubmit,
                userName,
                needsInnerApptainer,
+               jobscriptImage,
                accountingGroup,
                workflowID,
                stageID,
@@ -104,7 +108,8 @@ def submitJobs(numberToSubmit,
                desiredEntryNames,
                requestedProcessors,
                requestedRssBytes,
-               requestedWallSeconds))
+               requestedWallSeconds,
+               requestedGPU))
   try:
     wrapperText = open('/var/lib/justin/justin-wrapper-job','r').read()
   except Exception as e:
@@ -113,11 +118,16 @@ def submitJobs(numberToSubmit,
 
   justinJobSecret = secrets.token_urlsafe(64)
 
-  for (p, s) in (('###justin_job_secret###',  justinJobSecret),
-                 ('###justin_prodev###',      justin.proDev),
-                 ('###justin_workflow_id###', str(workflowID)),
-                 ('###justin_stage_id###',    str(stageID))
+  for (p, s) in (
+   ('###justin_job_secret###',                 justinJobSecret),
+   ('###justin_instance###',                   justin.instance),
+   ('###justin_workflow_id###',                str(workflowID)),
+   ('###justin_stage_id###',                   str(stageID)),
+   ('###justin_jobscript_image###',            jobscriptImage),
+   ('###justin_metacat_auth_server_url###',    justin.metacatAuthServerURL),
+   ('###justin_metacat_server_outputs_url###', justin.metacatServerOutputsURL)
                 ):
+    logLine('Replace %s with %s' % (p, str(s)))
     wrapperText = wrapperText.replace(p,s)
 
   try:    
@@ -133,18 +143,10 @@ def submitJobs(numberToSubmit,
   finally:
     wrapperFile.close()
 
-# ONLY RELY ON Desired_Entries 
-#  if needsInnerApptainer:
-#    innerApptainerTest = ('(isUndefined(target.JUSTIN_%s_Has_Inner_Apptainer) == TRUE || target.JUSTIN_%s_Has_Inner_Apptainer == TRUE) && '
-#                          % (justin.proDev.upper(), justin.proDev.upper()))
-#  else:
-#    innerApptainerTest = ''
-
   if not justin.htcondorSchedds:
     logLine('schedds missing from [htcondor] section of config')
     return
     
-#  'justin-prod-sched01.dune.hep.ac.uk'
   scheddHostname = random.choice(justin.htcondorSchedds)
   submitFile = ''
   
@@ -153,28 +155,49 @@ def submitJobs(numberToSubmit,
   for (name, value) in classads:
     submitFile += '+%s = "%s"\n' % (name, value)
 
+  if 'NERSC' in desiredSiteNames:
+    # DesiredOS is a bit of a hack. We should have a proper way to specify 
+    # the target OSs for the wrapper jobs
+    # The Requirements are also very either/or of NERSC vs elsewhere
+    submitFile += ('+DesiredOS = "SL7"\n'
+                   'Requirements = ('
+                   '(isUndefined(target.GLIDEIN_Site) == FALSE) && '
+                   '(stringListIMember(target.GLIDEIN_Site,my.Desired_Sites))'
+                   ')\n')
+  else:
+    submitFile += ('+DesiredOS = "SL7"\n'
+                   'Requirements = ('
+  '(target.HAS_Singularity==true) && '
+  '(target.HAS_CVMFS_dune_opensciencegrid_org==true) && '
+  '(target.HAS_CVMFS_larsoft_opensciencegrid_org==true) && '
+  '(target.HAS_CVMFS_fifeuser1_opensciencegrid_org==true) && '
+  '(target.HAS_CVMFS_fifeuser2_opensciencegrid_org==true) && '
+  '(target.HAS_CVMFS_fifeuser3_opensciencegrid_org==true) && '
+  '(target.HAS_CVMFS_fifeuser4_opensciencegrid_org==true) && '
+  '(target.HAS_CVMFS_dune_osgstorage_org==true) && '
+  '(isUndefined(target.GLIDEIN_Site) == FALSE) && '
+  '(stringListIMember(target.GLIDEIN_Site,my.Desired_Sites))'
+  ')\n')
+
   if workflowID == justin.awtWorkflowID:
     # Flag justIN AWT jobs
-    submitFile += ('+JUSTIN_%s_AWT = True\n' 
-                   'requirements = '
-  '((isUndefined(target.GLIDEIN_Site) == FALSE) && '
-  ' (stringListIMember(target.GLIDEIN_Site,my.Desired_Sites)))\n'
-                   % justin.proDev.upper())
+    submitFile += '+JUSTIN_%s_AWT = True\n' % justin.instance.upper()
   else:
     # Only include stage and entries ClassAds if not an AWT job
-    submitFile += ('+JUSTIN_%s_Stage = "w%ds%d"\n' 
+    submitFile += ('+JUSTIN_%s_Stage = "%s-w%ds%d"\n'
                    '+Desired_Entries = "%s"\n'
-                   'requirements = '
-  '((isUndefined(target.GLIDEIN_Entry_Name) == FALSE) && '
-  ' (stringListIMember(target.GLIDEIN_Entry_Name,my.Desired_Entries)))\n'
-                   % (justin.proDev.upper(), 
-                      workflowID, stageID, desiredEntryNames))
+                   % (justin.instance.upper(), 
+                      justin.instance, workflowID, stageID, desiredEntryNames))
+
+  if requestedGPU:
+   submitFile += '+RequestGPUs = 1\n'
 
   submitFile += """
 +Desired_Sites          = "%s"
-+SingularityImage       = "/cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:latest"
++SingularityImage       = "%s"
 +Jobsub_Group           = "dune"
 +Job_Expected_Max_Lifetime = %d
++Orig_AuthTokenGroups   = "/dune"
 universe                = vanilla
 environment = "JUSTIN_JOBSUB_ID=$(Cluster).$(Process)@%s"
 periodic_remove         = (JobStatus == 1) && ((time() - QDate) > 86400)
@@ -202,6 +225,7 @@ should_transfer_files   = YES
 when_to_transfer_output = ON_EXIT_OR_EVICT
 queue %d
 """ % (desiredSiteNames, 
+       justin.wrapperJobImage,
        requestedWallSeconds,
        scheddHostname,
        wrapperFile.name,
@@ -227,9 +251,13 @@ queue %d
                ['/usr/bin/condor_submit',
                 '-name',
                 scheddHostname,
+                '-pool',
+                justin.htcondorCollectors[0],
                 '-spool',
                 '-terse'
                ],
+               env      = dict(os.environ, 
+                 BEARER_TOKEN_FILE='/etc/justin-secrets/bearer-token-file'),
                input    = submitFile,
                encoding = 'utf-8',
                stderr   = subprocess.STDOUT,
@@ -241,7 +269,8 @@ queue %d
     logLine("condor_submit fails with error: " + str(e))
     return
   finally:
-    os.remove(wrapperFile.name)
+    if not justin.keepWrapperFiles:
+      os.remove(wrapperFile.name)
     
   logLine('%s' % str(outcome.stdout))
 
@@ -271,6 +300,7 @@ queue %d
                       'stage_id=%d,'
                       'site_id=%d,'
                       'requested_processors=%d,'
+                      'requested_gpu=%d,'
                       'requested_rss_bytes=%d,'
                       'requested_wall_seconds=%d,'
                       'submitted_time=NOW(),'
@@ -282,6 +312,7 @@ queue %d
                          stageID,
                          firstSiteID,
                          requestedProcessors,
+                         requestedGPU,
                          requestedRssBytes,
                          requestedWallSeconds,
                          justinJobSecret,
@@ -299,12 +330,19 @@ queue %d
                       siteID = firstSiteID,
                       justinJobID = justinJobID,
                       seconds = afterTime - beforeTime)
-
+      try:
+        justin.insertUpdate(
+          'INSERT INTO jobs_logs SET justin_job_id=%d,saved_time=NOW()'
+          % justinJobID) 
+      except Exception as e:
+        # Try to keep going. Handle this downstream as if deleted?
+        logLine('INSERT INTO jobs_logs fails with: ' + str(e))
+        
   # Record that we've done a submission if just for one site
   if firstSiteID:
     try:
       justin.cur.execute('UPDATE sites SET last_submitted_time=NOW() '
-                            'WHERE site_id=%d' % firstSiteID)
+                         'WHERE site_id=%d' % firstSiteID)
 
     except Exception as e:
       # But try to keep going
@@ -320,19 +358,22 @@ def workflowJobs():
   try:
     stagesRows = justin.select(
      'SELECT workflows.workflow_id,stages.stage_id,max_distance,'
-     'wlcg_group_name,stages.processors,stages.wall_seconds,stages.rss_bytes,'
-     'principal_names.principal_name,condor_group_name '
+     'wlcg_group_name,stages.processors,stages.needs_gpu,'
+     'stages.wall_seconds,stages.rss_bytes,scopes.quota_id,'
+     'principal_names.principal_name,condor_group_name,jobscript_image '
      'FROM workflows '
      'LEFT JOIN stages ON stages.workflow_id=workflows.workflow_id '
      'LEFT JOIN scopes ON workflows.scope_id=scopes.scope_id '
-     'LEFT JOIN wlcg_groups ON wlcg_groups.wlcg_group_id=scopes.wlcg_group_id '
+     'LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id '
+     'LEFT JOIN wlcg_groups '
+     'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
      'LEFT JOIN users ON users.user_id=workflows.user_id '
      'LEFT JOIN principal_names '
      'ON principal_names.user_id=users.main_pn_id '
-# GET condor_group_id FROM workflows ONCE ALL ACTIVE WORKFLOWS HAVE THEM
      'LEFT JOIN condor_groups '
      'ON condor_groups.condor_group_id=scopes.condor_group_id '
      'WHERE workflows.state="running" AND workflows.workflow_id<>%d '
+     'AND users.processing_enabled AND named_quotas.processing_enabled '
      'ORDER BY workflows.workflow_id'
      % justin.awtWorkflowID, showQuery = False
                               )
@@ -344,19 +385,6 @@ def workflowJobs():
   for stageRow in stagesRows:
   
     logLine('Processing ' + str(stageRow))
-
-    # Count unallocated files for this stage    
-    try:
-      row = justin.select('SELECT COUNT(*) AS count FROM files '
-                          'WHERE workflow_id=%d AND stage_id=%d '
-                          'AND state="unallocated"'
-                          % (stageRow['workflow_id'],
-                             stageRow['stage_id']), justOne = True)
-   
-      unallocatedCount = int(row['count'])
-    except Exception as e:
-      logLine('Failed to get unallocated count: ' + str(e))
-      continue
 
     # Count submitted jobs for this stage    
     try:
@@ -372,13 +400,30 @@ def workflowJobs():
       logLine('Failed to get submitted count: ' + str(e))
       continue
 
+    if submittedCount > maxSubmitted:
+      logLine('Skipping due to number already submitted > %d' % maxSubmitted)
+      continue
+
+    # Count unallocated files for this stage    
+    try:
+      row = justin.select('SELECT COUNT(*) AS count FROM files '
+                          'WHERE workflow_id=%d AND stage_id=%d '
+                          'AND state="unallocated"'
+                          % (stageRow['workflow_id'],
+                             stageRow['stage_id']), justOne = True)
+   
+      unallocatedCount = int(row['count'])
+    except Exception as e:
+      logLine('Failed to get unallocated count: ' + str(e))
+      continue
+
     logLine('unallocatedCount=%d  submittedCount=%d  maxSubmitted=%d' 
             % (unallocatedCount, submittedCount, maxSubmitted))
 
     if int(unallocatedCount * jobsRatio + 0.9999) > submittedCount:
       # Need to submit more jobs: find suitable entries and sites
       try:
-        entriesRows = justin.select(
+        query = (
    "SELECT DISTINCT entries.entry_name,sites.jobsub_site_name,sites.site_name "
    "FROM files "
    "LEFT JOIN replicas ON files.file_id=replicas.file_id "
@@ -387,6 +432,9 @@ def workflowJobs():
    "AND sites_storages.distance <= %f "
    "LEFT JOIN entries ON entries.site_id=sites_storages.site_id "
    "LEFT JOIN sites ON sites.site_id=entries.site_id "
+   "LEFT JOIN stages_sites ON stages_sites.site_id=entries.site_id "
+   "AND stages_sites.workflow_id=%d "
+   "AND stages_sites.stage_id=%d "
    "WHERE files.workflow_id=%d "
    "AND files.stage_id=%d "
    "AND files.state='unallocated' " 
@@ -396,13 +444,22 @@ def workflowJobs():
    "AND NOT storages.decommissioned "
    "AND sites.site_id IS NOT NULL "
    "AND sites.enabled "
+   "AND stages_sites.site_id IS NOT NULL "
+   "AND %s entries.entry_has_gpus "
    "%s "
    "ORDER BY sites_storages.distance,files.file_id "
          % (stageRow['max_distance'],
             stageRow['workflow_id'],
             stageRow['stage_id'],            
+            stageRow['workflow_id'],
+            stageRow['stage_id'],            
+            '' if stageRow['needs_gpu'] else 'NOT',
             '' if (stageRow['wlcg_group_name'] == '/dune/production') 
             else 'AND entries.always_inner_apptainer'))
+
+        logLine(query)
+
+        entriesRows = justin.select(query)
 
       except Exception as e:
         logLine('Failed to get list of entries/sites: ' + str(e))
@@ -410,10 +467,6 @@ def workflowJobs():
         
       logLine('entriesRows %s' % str(entriesRows))
  
-      if submittedCount > maxSubmitted:
-        logLine('Skipping due to number already submitted > %d' % maxSubmitted)
-        continue
-
       desiredSites   = set()
       desiredEntries = set()
     
@@ -457,8 +510,11 @@ def workflowJobs():
  
         submitJobs(numberToSubmit       = numberToSubmit,
                    userName             = stageRow['principal_name'],
-                   needsInnerApptainer  = (stageRow['wlcg_group_name'] 
-                                           != '/dune/production'),
+                   needsInnerApptainer  = ((stageRow['wlcg_group_name'] 
+                                            != '/dune/production') or 
+                                           (stageRow['jobscript_image'] 
+                                            != justin.wrapperJobImage)),
+                   jobscriptImage       = stageRow['jobscript_image'],
                    accountingGroup      = condorGroupName,
                    workflowID           = stageRow['workflow_id'],
                    stageID              = stageRow['stage_id'],
@@ -468,18 +524,16 @@ def workflowJobs():
                    desiredEntryNames    = desiredEntryNames,
                    requestedProcessors  = stageRow['processors'],
                    requestedRssBytes    = stageRow['rss_bytes'],
-                   requestedWallSeconds = stageRow['wall_seconds'])
-
-#       logLine('%d processors %d MB has %d submitted and %d unallocated' % 
-#            (processors, 
-#             int((bytesPerProcessor * processors) / (1024 * 1024)),
-#             numberSubmitted, numberUnallocated))
+                   requestedWallSeconds = stageRow['wall_seconds'],
+                   requestedGPU         = int(stageRow['needs_gpu']))
 
 def awtJobsToSites():
   # Go through the sites submitting AWT jobs
-
   try:
-    rows = justin.select('SELECT site_id,site_name,jobsub_site_name '
+    rows = justin.select('SELECT site_id,site_name,jobsub_site_name,'    
+                         '(SELECT COUNT(*) FROM entries'
+                         ' WHERE entries.site_id=sites.site_id'
+                         ' AND entry_has_gpus) > 0 AS has_gpu_entries '
                          'FROM sites ORDER BY site_name')
 
   except Exception as e:
@@ -487,10 +541,26 @@ def awtJobsToSites():
     return
   
   for row in rows:
+    # Almost always submit a catch-all job
+    if row['site_name']  in ['US_NERSC-GPU',
+                             'US_NERSC-CUSTOM']:
+      requestedGPUsList = [   ]
+    else:
+      requestedGPUsList = [ 0 ]
+
+    # Also submit a GPU job if any GPU entries
+    if row['has_gpu_entries']:
+      requestedGPUsList.append(1)
+
+    # Submit one or two jobs per site        
+    for requestedGPU in requestedGPUsList:
       submitJobs(numberToSubmit       = 1,
                  userName             = 'dunepro',
                  needsInnerApptainer  = False,
-                 accountingGroup      = 'group_dune.prod_mcsim',
+                 jobscriptImage       = (justin.jobscriptImagePrefix + '/' + 
+                                         justin.jobscriptImageSuffix + ':' +               
+                                         justin.jobscriptImageVersion),
+                 accountingGroup      = 'group_dune.prod',
                  workflowID           = justin.awtWorkflowID,
                  stageID              = 1,
                  firstSiteID          = row['site_id'],
@@ -499,10 +569,14 @@ def awtJobsToSites():
                  desiredEntryNames    = '',
                  requestedProcessors  = 1,
                  requestedRssBytes    = 1024 * 1024 * 1024,
-                 requestedWallSeconds = 3600)
+                 requestedWallSeconds = 3600,
+                 requestedGPU         = requestedGPU)
+
     
 def oneCycle():
   # Update the database with the states of submitted jobsub jobs
+
+  random.seed()
 
 #  logLine("updateSiteCounts()")
 #  updateSiteCounts()
@@ -517,132 +591,16 @@ def oneCycle():
     logLine("awtJobsToSites()")
     awtJobsToSites()
 
-  logLine("workflowJobs()")
-  workflowJobs()
+  pingRucioMilliseconds = justin.pingRucioMilliseconds()
+  justin.logLine('pingRucioMilliseconds returns %d' % pingRucioMilliseconds)
+  if pingRucioMilliseconds < justin.overloadRucioMilliseconds:
+    logLine("Start workflowJobs()")
+    workflowJobs()
+  else:
+    justin.logLine('Skip workflowJobs() as Rucio overloaded')
 
 #
 # PROGRAM MAIN
 #
-
 if __name__ == '__main__':
-
-  if len(sys.argv) > 1 and sys.argv[1] == '--container':
-    notContainer = False
-  else:
-    notContainer = True
-
-  if notContainer and os.fork() != 0:
-    sys.exit() # first parent
-
-  else:
-    os.chdir("/")
-    os.umask(0)
-
-    if notContainer:
-      os.setsid()
-
-    if notContainer and os.fork() != 0:
-      sys.exit() # second parent
-
-    else:
-
-      try:
-        os.makedirs('/var/run/justin/last-updates',
-                    stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | 
-                    stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
-      except:
-        pass
-                
-      try:
-        f = open('/var/run/justin/job-factory.pid', 'w')
-        f.write(str(os.getpid()) + '\n')
-        f.close()
-      except:
-        print('Failed to create /var/run/justin/job-factory.pid - exiting')
-        sys.exit(1)
-
-      # Close stdin now
-      si = open('/dev/null', 'r')
-      os.dup2(si.fileno(), sys.stdin.fileno())
-
-      while True:
-
-        # Ensure /var/log/justin directory exists
-        try:
-          os.makedirs('/var/log/justin', 
-                      stat.S_IRUSR|stat.S_IWUSR|stat.S_IXUSR|stat.S_IRGRP|stat.S_IXGRP|stat.S_IROTH|stat.S_IXOTH)
-        except:
-          pass
-
-        # Close and reopen stdout->log file, in case of logrotate
-        try:
-          close(so)
-        except:
-          pass
-
-        so = open('/var/log/justin/job-factory', 'a+')
-        os.dup2(so.fileno(), sys.stdout.fileno())
-
-        # Close and reopen stderr->log file, in case of logrotate
-        try:
-          close(se)
-        except:
-          pass
-          
-        se = open('/var/log/justin/job-factory', 'a+')
-        os.dup2(se.fileno(), sys.stderr.fileno())
-
-        try:
-          pf = open('/var/run/justin/job-factory.pid', 'r')
-          pid = int(pf.read().strip())
-          pf.close()
-
-          if pid != os.getpid():
-            print('new /var/run/justin/job-factory.pid - exiting')
-            break
-
-        except:
-          print('no /var/run/justin/job-factory.pid - exiting')
-          break
-
-        # Fork a subprocess to run each cycle
-        cyclePid = os.fork()
-
-        if cyclePid == 0:
-          logLine('=============== Start cycle ===============')
-          
-          justin.readConf()
-          
-          try:
-            justin.conn = MySQLdb.connect(
-                          host   = socket.gethostbyname(justin.mysqlHostname),
-                          user   = justin.mysqlUsername,
-                          passwd = justin.mysqlPassword,
-                          db     = justin.mysqlDbName)
-            justin.conn.autocommit(False)
-            justin.cur = justin.conn.cursor(MySQLdb.cursors.DictCursor)
-          except Exception as e:
-            logLine('Failed to create database connection (' + str(e) + ') - skipping cycle')
-          else:
-            try:
-              p = pwd.getpwnam(justin.agentUsername)
-              os.chown('/var/run/justin/last-updates', p[2], p[3])
-              os.setgid(p[3])
-              os.setuid(p[2])
-              oneCycle()
-            except Exception as e:
-              print('Cycle fails with exception ' + str(e))
-
-            justin.conn.close()
-
-          logLine('================ End cycle ================')
-          sys.exit(0)
-
-        # wait for cyclePid subprocess to finish
-        os.waitpid(cyclePid, 0)
-
-        # wait the allotted time between cycles
-        time.sleep(sleepSeconds)
-
-      sys.exit(0) # if we break out of the while loop then we exit
-
+  justin.agentMainLoop('job-factory', oneCycle, sleepSeconds, 3600)

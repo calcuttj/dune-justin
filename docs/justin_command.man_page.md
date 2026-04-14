@@ -2,7 +2,7 @@
 This man page is distributed along with the 
 [justin command](justin_command.md) itself.
 
-    JUSTIN(2023)							  JUSTIN(2023)
+    JUSTIN(2024)							  JUSTIN(2024)
     
     NAME
            justin - justIN workflow system utility command
@@ -23,6 +23,13 @@ This man page is distributed along with the
            -v, --verbose
     	      Turn on verbose logging of the communication with justIN
     	      service.
+    
+    
+           --instance INST
+    	      Use an alternative justIN service, rather than "fnal" instance
+    	      at Fermilab.  This option is normally only needed during
+    	      development and testing, and it may be convenient to set this
+    	      option via $JUSTIN_OPTIONS described in Environment below.
     
     
            --url URL
@@ -49,7 +56,8 @@ This man page is distributed along with the
     
            create-workflow [--description DESC] [--mql QUERY|--monte-carlo COUNT]
     	      [--scope SCOPE] [--refind-end-date YYYYMMDD]
-    	      [--refind-interval-hours HOURS]
+    	      [--refind-interval-hours HOURS] [--workflow-id-file FILENAME]
+    	      [--campaign ID]
     	      Create a new, empty workflow in the database, optionally with
     	      the given short, human-readable description and either a MetaCat
     	      Query Language expression or the count of the number of Monte
@@ -60,6 +68,12 @@ This man page is distributed along with the
     	      storage. Scopes also determine which HTCondor group wrapper jobs
     	      are submitted to. If not given, the default scope usertests is
     	      used.
+    
+    	      --campaign-id ID specifies the campaign ID to use when creating
+    	      the workflow. If not given, then the next available ID number is
+    	      used and a new campaign created. If given, the ID must match an
+    	      existing campaign which is owned by the same named quota as the
+    	      scope of the workflow.
     
     	      The options --refind-interval-hours (default 1) and
     	      --refind-end-date (default: today in UTC) can be used to cause
@@ -73,6 +87,10 @@ This man page is distributed along with the
     	      returns the new workflow's ID number.  Once the workflow is in
     	      the running state, justIN will use the MQL expression to find
     	      the list of input files from MetaCat.
+    
+    	      The option --workflow-id-file FILENAME can be used to append a
+    	      line with the ID of the new workflow to the given file.
+    
     
            show-workflows [--workflow-id ID]
     	      Show details of all workflows or optionally of a single
@@ -98,42 +116,48 @@ This man page is distributed along with the
     
     
            finish-workflow --workflow-id ID
-    	      Changes the state of the given running workflow to "finished".
-    	      This state excludes a workflow from the workflow allocation
-    	      process.
+    	      Changes the state of the given workflow from "draft",
+    	      "submitted", or "running" to "finished". This state excludes a
+    	      workflow from the allocation process.
     
     
            create-stage --workflow-id ID --stage-id ID  --jobscript
-    	      FILENAME|--jobscript-id JSID [--wall-seconds N] [--rss-mb N]
-    	      [--processors N] [--max-distance DIST] [--output-pattern
-    	      PATTERN:DESTINATION] [--output-pattern-next-stage
-    	      PATTERN:DATASET] [--output-rse NAME] [--lifetime-days DAYS]
-    	      [--env NAME=VALUE] [--classad NAME=VALUE]
+    	      FILENAME|--jobscript-git ORG/PATH:TAG [--wall-seconds N]
+    	      [--rss-mib N] [--processors N] [--gpu] [--max-distance DIST]
+    	      [--output-pattern PATTERN[:DESTINATION]]
+    	      [--output-pattern-next-stage PATTERN[:DATASET]] [--output-rse
+    	      NAME] [--output-rse-expression EXPRESSION] [--lifetime-days
+    	      DAYS] [--env NAME=VALUE] [--classad NAME=VALUE] [--site
+    	      SITENAME] [--image IMAGENAME]
     	      Creates a new stage for the given workflow ID with the given
     	      stage ID. Stages must be numbered consecutively from 1, and each
     	      workflow must have at least one stage.
     
     	      Each stage must have a jobscript shell script associated with
-    	      it, given by the --jobscript or --jobscript-id options.  Either
-    	      the full, local path to the jobscript file is given, or the
-    	      jobscript is taken from justIN's Jobscripts Library using a JSID
-    	      jobscript identifier.  The JSID is in the form SCOPE:NAME or
-    	      USER:NAME, where USER includes an '@' character. In either case,
-    	      a copy of the current text of the jobscript is cached in the
-    	      stage definition and executed on worker nodes to process the
-    	      stage's files.
+    	      it, given by the --jobscript or --jobscript-git options.	Either
+    	      the full, local path to the jobscript file is given, or a
+    	      reference to a tag or revison hash in GitHub is given.  A GitHub
+    	      reference takes the form PATH:TAG where TAG is a git tag or SHA1
+    	      revision hash, and PATH is the path to the jobscript file in
+    	      GitHub's URL space, of the form
+    	      ORGANISATION/REPO/DIRECTORIES/.../FILE.jobscript .  In both
+    	      scenarios, a copy of the current text of the jobscript is cached
+    	      in the stage definition and executed on worker nodes to process
+    	      the stage's files.
     
     	      If the maximum wallclock time needed is not given by
     	      --wall-seconds then the default of 80000 seconds is used. The
     	      value used is available to jobscripts as $JUSTIN_WALL_SECONDS.
     	      If the maximum amount of resident memory needed is not given by
-    	      --rss-mb then the default of 2000MiB is used. The resident
+    	      --rss-mib then the default of 2000MiB is used. The resident
     	      memory corresponds to the physical memory managed by HTCondor's
     	      ResidentSetSize value and is available to jobscripts as
-    	      $JUSTIN_RSS_MB.  If the script can make use of multiple
+    	      $JUSTIN_RSS_MIB.	If the script can make use of multiple
     	      processors then --processors can be used to give the number
     	      needed, with a default of 1 if not given. The value used is
-    	      available to jobscripts as $JUSTIN_PROCESSORS.
+    	      available to jobscripts as $JUSTIN_PROCESSORS.  If given then
+    	      --gpu will require that jobs for this stage have access to a
+    	      GPU.
     
     	      By default, input files will only be allocated to a script which
     	      are on storages at the same site (distance=0). This can be
@@ -141,12 +165,12 @@ This man page is distributed along with the
     	      be allocated on storages at greater distances, up to a value of
     	      100 which represents maximally remote storages.
     
-    	      If one or more options --output-pattern PATTERN:DESTINATION is
+    	      If one or more options --output-pattern PATTERN[:DESTINATION] is
     	      given then the wrapper job will look for files created by the
     	      script which match the pattern given as PATTERN. The pattern is
     	      a Bash shell pattern using *, ? and [...] expressions. See the
-    	      bash(1) Pattern Matching section for details.  The DESTINATION
-    	      component has any of the variables $JUSTIN_SCOPE,
+    	      bash(1) Pattern Matching section for details.  If given, the
+    	      DESTINATION component has any of the variables $JUSTIN_SCOPE,
     	      $JUSTIN_WORKFLOW_ID, or $JUSTIN_STAGE_ID replaced. The form
     	      ${JUSTIN_SCOPE} etc may also be used.  If the given DESTINATION
     	      starts with https:// then the matching output files will be
@@ -156,35 +180,42 @@ This man page is distributed along with the
     	      subdirectories for workflow ID and stage ID will be added, and
     	      resulting output files placed there. The user's token from the
     	      justIN dashboard is used for the upload.	If an https:// URL is
-    	      not given, DESTINATION is interpreted as a Rucio dataset minus
-    	      the scope component. The overall scope of the workflow is used
-    	      and the output files are uploaded with Rucio and registered in
-    	      that dataset. If the dataset does not already exist then it will
-    	      be created when the workflow changes state from submitted to
-    	      running with a rule with a lifetime of --lifetime-days days.
-    	      Furthermore, files for Rucio-managed storage must have a
-    	      corresponding JSON metadata file with the same name but with
-    	      ".json" appended, that will be recorded for that file in
-    	      MetaCat.
+    	      not given, DESTINATION is used when constructing the output
+    	      dataset names. Datasets have the form DESTINATION-INST-wXsYpZ
+    	      where INST is the instance, X is the workflow ID, Y is the
+    	      stage, and Z is the output pattern ID number, starting from 1.
+    	      If DESTINATION is not given then only the form wXsYpZ is used.
     
-    	      Alternatively --output-pattern-next-stage PATTERN:DATASET can be
-    	      given in which case the output file will be uploaded to Rucio-
-    	      managed storage and will also be registered in the justIN
+    	      Files for Rucio-managed storage may have a corresponding JSON
+    	      metadata file with the same name but with ".json" appended, that
+    	      will be recorded in the metadata for that file in MetaCat. If
+    	      this is not given, then basic workflow metadata will still be
+    	      recorded. If output files have parent-child relations, the
+    	      parent output pattern must be given before the child so that the
+    	      parents are known to MetaCat before the children declare them to
+    	      be parents.
+    
+    	      Alternatively --output-pattern-next-stage PATTERN[:DESTINATION]
+    	      can be given in which case the output file will be uploaded to
+    	      Rucio-managed storage and will also be registered in the justIN
     	      Database as an unprocessed input file for the next stage and
     	      available for allocation to instances of that stage's script.
     
     	      --lifetime-days DAYS sets the Rucio rule lifetime when creating
-    	      a new dataset, for all output files that are uploaded in the
-    	      given stage. If --output-pattern or --output-pattern-next-stage
-    	      are given and refer to a Rucio dataset that does not already
-    	      exist, then the lifetime-days option is required.
+    	      Rucio datasets for output files.	If any Rucio datasets are used
+    	      for outputs, then this is option is required.
     
     	      If one or more options --output-rse NAME is given, then the RSE
-    	      used for uploads of output files will be chosen from that list
-    	      of RSEs, with preference given to RSEs which are closer in
-    	      distance. If this option is not used, or none of the given RSEs
-    	      are available, then the default algorithm for choosing the
-    	      closest available RSE is used.
+    	      used for uploads of output files and log tgz files will be
+    	      chosen from that list of RSEs, with preference given to RSEs
+    	      which are closer in distance. If this option is not used, or
+    	      none of the given RSEs are available, then the default algorithm
+    	      for choosing the closest available RSE is used.
+    
+    	      If --output-rse-expression EXPRESSION is given, then it is used
+    	      when creating rules for Rucio datasets for outputs, but not for
+    	      the per-RSE datasets used to keep a copy of the output file on
+    	      the RSE it is first uploaded to.
     
     	      --env NAME=VALUE can be used one or more times to set
     	      environment variables when the stage's jobscript is executed.
@@ -192,19 +223,44 @@ This man page is distributed along with the
     	      --classad NAME=VALUE can be used one or more times to add
     	      ClassAds to the jobs submitted for this stage.
     
+    	      --site SITENAME can be used to restrict jobs for this stage to a
+    	      single site for testing.	If the site is not available, then no
+    	      jobs will run.
+    
+    	      --image IMAGENAME can override the default Apptainer image
+    	      (fnal-wn-sl7:latest) in which user jobscripts are run. The image
+    	      tree must exist within
+    	      /cvmfs/singularity.opensciencegrid.org/fermilab/ and if does not
+    	      contain ":" then ":latest" is appended to the name given.
+    
     
            simple-workflow [--description DESC] [--mql QUERY|--monte-carlo COUNT]
     	      [--scope SCOPE] [--refind-end-date YYYYMMDD]
     	      [--refind-interval-hours HOURS] --jobscript
-    	      FILENAME|--jobscript-id JSID [--wall-seconds N] [--rss-mb N]
-    	      [--processors N] [--max-distance DIST] [--output-pattern
-    	      PATTERN:DESTINATION] [--output-rse NAME] [--lifetime-days DAYS]
-    	      [--env NAME=VALUE] [--classad NAME=VALUE]
+    	      FILENAME|--jobscript-git ORG/PATH:TAG [--wall-seconds N]
+    	      [--rss-mib N] [--processors N] [--gpu] --max-distance DIST]
+    	      [--output-pattern PATTERN[:DESTINATION]] [--output-rse NAME]
+    	      [--output-rse-expression EXPRESSION] [--lifetime-days DAYS]
+    	      [--env NAME=VALUE] [--classad NAME=VALUE] [--site SITENAME]
+    	      [--image IMAGENAME] [--workflow-id-file FILENAME] [--campaign-id
+    	      ID]
     	      Combines the create-workflow, create-stage and submit-workflow
     	      subcommands into a single operation, for use with single-stage
     	      workflows. The options are repeated from the first two
     	      subcommands and are described in their respective sections
     	      above.
+    
+    
+           create-campaign [--description DESC] [--quota QUOTA]
+    	      [--campaign-id-file FILENAME]
+    	      Create a new campaign in the database, optionally with the given
+    	      short, human-readable description.
+    
+    	      --quota QUOTA specifies the named quota to assign the campaign
+    	      to instead of the default usertests.
+    
+    	      The option --campaign-id-file FILENAME can be used to append a
+    	      line with the ID of the new campaign to the given file.
     
     
            show-stages --workflow-id ID [--stage-id ID]
@@ -214,28 +270,10 @@ This man page is distributed along with the
     	      processors, max wallclock seconds, max RSS bytes, and the max
     	      distance value.
     
-    
-           create-jobscript [--description DESC] [--scope SCOPE] --name NAME
-    	      --jobscript FILENAME
-    	      Creates a named jobscript in the Jobscripts Library, with an
-    	      optional description. The jobscript is created with the
-    	      specified scope if one is given. Otherwise the jobscript is
-    	      created under your user name. The jobscript identifier is
-    	      returned on success, in the form SCOPE:NAME or USER:NAME.
-    	      Jobscript names must be unique for each scope or user name. If a
-    	      jobscript already exists for the given scope or user name it is
-    	      overwritten.
-    
-           show-jobscript --jobscript-id JSID
+           show-jobscript --jobscript-git ORG/PATH:TAG
            show-jobscript --workflow-id ID --stage-id ID
-    	      Show a jobscript, referenced either by a jobscript identifier or
-    	      by workflow and stage. If an identifier is given, the jobscript
-    	      is taken from the Jobscripts Library. The JSID identifier
-    	      consists of USER:NAME or SCOPE:NAME, where NAME is the jobscript
-    	      name, USER is the user name of any user and contains an '@'
-    	      character, and SCOPE is a Rucio scope name known to justIN.
-    	      Alternatively, if workflow and stage are given, then the
-    	      jobscript cached for that workflow and stage is shown.
+    	      Show the given jobscript, either by GitHub reference or by
+    	      workflow and stage.
     
            show-stage-outputs --workflow-id ID --stage-id ID
     	      Shows the datasets to be assigned and the patterns used to find
@@ -274,11 +312,55 @@ This man page is distributed along with the
     	      jobs listed. For each job, the Jobsub ID, Workflow ID, Stage ID,
     	      State, and creation time are shown.
     
+           fetch-logs --jobsub-id ID [--unpack]
+    	      Download and optionally unpack the logs.tgz file for a given
+    	      job. The file is placed in the current directory and if the
+    	      --unpack option is given, it will be unpacked into a directory
+    	      named for the job.  This subcommand uses justIN authentication
+    	      and does not require that you have an X.509 proxy or use the
+    	      Rucio client. However, it is not as efficient as the standalone
+    	      justin-fetch-logs command.
+    
+           get-token [--production]
+    	      Download the current WLCG Token cached by justIN for the current
+    	      user. This is stored at $BEARER_TOKEN_FILE if set, or
+    	      /run/user/UID/bt_uUID if /run/user/UID exists, or /tmp/bt_uUID
+    	      in other cases, where UID is the local user's Unix user ID. If
+    	      the verbose option is given, the path to the resulting token
+    	      file and time left is shown.
+    	      While DUNE is still dependent on X.509 proxies for some
+    	      storages, this subcommand also requests a DUNE X.509 user proxy
+    	      which is authorized to read from Rucio and Rucio-managed
+    	      storage. This is stored at $X509_USER_PROXY if set, and at
+    	      /tmp/x509up_uUID in other cases. If the option --production is
+    	      given and you are member of the group /dune/production, this
+    	      proxy is also capable of writing directly to storage and issuing
+    	      Rucio data management commands.
+    	      For both token and proxies files, if the file already exists it
+    	      will be overwritten unless the user write permission is unset.
+    	      In this case the command will exit with an error. This feature
+    	      can be used to protect important proxies or tokens created by
+    	      another mechanism from accidental replacement.
+    
     
     JOBSCRIPTS
            The user jobscripts supplied when creating a stage are shell scripts
            which the wrapper jobs execute on the worker nodes matched to that
-           stage.  They are started in an empty workspace directory.  Several
+           stage.
+    
+           When specifying a jobscript to the justin command, either the full,
+           local path to the jobscript file is given, or a reference to a tag or
+           revison hash in GitHub is given.  (Other git repository services may be
+           added in the future.)
+    
+           A GitHub reference takes the form PATH:TAG where TAG is a git tag or
+           SHA1 revision hash, and PATH is the path to the jobscript file in
+           GitHub's URL space, of the form
+           ORGANISATION/REPO/DIRECTORIES/.../FILE.jobscript .  In both scenarios,
+           a copy of the current text of the jobscript is cached in the stage
+           definition and executed on worker nodes to process the stage's files.
+    
+           Jobscripts are run in an empty workspace directory.  Several
            environment variables are made available to the scripts, all prefixed
            with JUSTIN_, including $JUSTIN_WORKFLOW_ID, $JUSTIN_STAGE_ID and
            $JUSTIN_SECRET which allows the jobscript to authenticate to justIN's
@@ -297,9 +379,9 @@ This man page is distributed along with the
     	 pfn=`echo $did_pfn_rse | cut -f2 -d' '`
     	 rse=`echo $did_pfn_rse | cut -f3 -d' '`
     
-           If no file is available to be processed, then justin-get-file produces
-           no output to stdout, which should also be checked for. justin-get-file
-           logs errors to stderr.
+           If no file is available to be processed, then justin-get-file returns a
+           non-zero exit code and produces no output to stdout, which should also
+           be checked for. justin-get-file logs errors to stderr.
     
            justin-get-file can be called multiple times to process more than one
            file in the same jobscript. This can be done all at the start or
@@ -307,6 +389,16 @@ This man page is distributed along with the
            simple wrapper around the curl command and it would also be possible to
            access the justIN allocator service's REST API directly from an
            application.
+    
+           justin-get-file has a single option which may also be given:
+           --seconds-needed NNNN where NNNN is the maximum number of wallclock
+           seconds which will be needed by the jobscript to process another file
+           and finish. If there is not enough time left based on the
+           --wall-seconds option used when defining the stage, then justin-get-
+           file will in that case return an empty result and a non-zero exit code,
+           just as if no more files were available for processing. This can easily
+           be used to create jobscripts which process a series of input files
+           without running out of time on the last one.
     
            Each file returned by justin-get-file is marked as allocated and will
            not be processed by any other jobs. When the jobscript finishes, it
@@ -382,4 +474,4 @@ This man page is distributed along with the
     SEE ALSO
            bash(1)
     
-    justIN Manual			    justin			  JUSTIN(2023)
+    justIN Manual			    justin			  JUSTIN(2024)

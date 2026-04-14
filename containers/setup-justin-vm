@@ -1,0 +1,69 @@
+#!/bin/sh
+#
+# Script to set up components needed by justIN containers on a host VM
+#
+# Tested on Rocky9
+#
+
+echo 'Have you run  hostnamectl set-hostname justin-xxx-nn.dune.hep.ac.uk  ?'
+
+if [ ! -d /etc/justin-secrets ] ; then
+ echo 'Copy /etc/justin-secrets here first!'
+ exit 1
+fi
+
+if [ ! -d /etc/justin-letsencrypt ] ; then
+ echo 'Copy /etc/justin-letsencrypt here first!'
+ exit 1
+fi
+
+if [ ! -d /etc/justin.d ] ; then
+ echo 'Copy /etc/justin.d here first!'
+ exit 1
+fi
+
+# Create the dunejustin account before anything else
+useradd --uid 1026 --user-group dunejustin
+chown dunejustin.dunejustin /etc/justin-secrets/justin-jobs-*.pem
+
+yum -y update 
+#dnf config-manager \
+#  --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+yum -y install ca_policy_igtf-classic git joe mariadb-server \
+               podman
+
+chown mysql.mysql /etc/justin-secrets/justin-db-*.pem
+
+#echo '{ "mtu": 1450 }' > /etc/docker/daemon.json
+#systemctl enable docker
+#systemctl start docker
+
+(
+cd /tmp
+git clone https://github.com/DUNE/dune-justin.git
+
+cp -f dune-justin/database/justin-server.cnf   /etc/my.cnf.d
+cp -f dune-justin/containers/justin-client.cnf /etc/my.cnf.d
+systemctl enable mariadb
+systemctl start mariadb
+
+mysql < dune-justin/database/justindb-create-tables.sql 
+
+cp -f dune-justin/containers/justin-podman-wrapper /usr/sbin
+cp -f dune-justin/containers/*.service /usr/lib/systemd/system/
+systemctl daemon-reload
+systemctl enable justin-finder
+systemctl enable justin-info-collector
+systemctl enable justin-httpd
+systemctl enable justin-job-factory
+systemctl enable justin-job-logs
+
+mkdir -p /root/bin/
+cp -f dune-justin/containers/clone-build-justin-container /root/bin/
+)
+
+mkdir -p /var/log/justin /var/log/httpd 
+mkdir -p /var/run/justin/overrides /var/run/justin/last-updates
+
+
+

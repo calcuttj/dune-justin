@@ -1,5 +1,7 @@
 # DUNE justIN tutorial
 
+[TOC]
+
 ## Prerequisites
 
 This tutorial has been tested on the DUNE dunegpvm computers at Fermilab and on
@@ -8,19 +10,17 @@ if you run into problems please use dunegpvmXX or lxplus instead.
 
 You need to be a member of DUNE and have a Fermilab computer account. You
 can check this by going to the justIN dashboard at 
-[https://justin.dune.hep.ac.uk/dashboard/](https://justin.dune.hep.ac.uk/dashboard/)
+[https://dunejustin.fnal.gov/dashboard/](https://dunejustin.fnal.gov/dashboard/)
 and logging in: go to that address, click on the orange Login button on the 
 top right and follow the instructions. If you get back to the justIN
 dashboard with your NAME@fnal.gov shown in place of the Login button, you
 have the right registrations.
 
-For one section of the tutorial you will need to be able to create a VOMS
-proxy with the command `voms-proxy-init`, which anyone in DUNE should be
-able to do.
-
-Before following this tutorial, make sure you can initialise the DUNE UPS 
+Before following this tutorial, make sure you can enter an SL7 Apptainer 
+container and then initialise the DUNE UPS 
 environment from cvmfs and set up justin with these commands:
 
+    /cvmfs/dune.opensciencegrid.org/products/dune/justin/justin-sl7-setup
     source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
     setup justin
     justin version
@@ -31,9 +31,10 @@ You should see a version number displayed.
 
 Now we can start the tutorial itself.
 
-Set up DUNE UPS and justin if you've not already done that within your
-session:
+Enter an SL7 Apptainer container and set up DUNE UPS and justin if you've not 
+already done that within your session:
 
+    /cvmfs/dune.opensciencegrid.org/products/dune/justin/justin-sl7-setup
     source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
     setup justin
 
@@ -47,12 +48,12 @@ The justin command will display a message like this:
 
     To authorize this computer to run the justin command, visit this page with your
     usual web browser and follow the instructions within the next 10 minutes:
-    https://justin.dune.hep.ac.uk/authorize/.........
+    https://dunejustin.fnal.gov/authorize/.........
 
-    Check that the Session ID displayed on that page is .......
-
-    Once you've followed the instructions on that web page, you can run the justin
-    command without needing to authorize this computer again for 7 days.
+    Check that the Session ID displayed on that page is ....
+ 
+    Once you've followed the instructions on that web page, please run the command
+    you tried again. You won't need to authorize this computer again for 7 days.
 
 Follow those instructions to authorize the justin command to run on your
 account on that computer. Then repeat the time subcommand. 
@@ -68,12 +69,18 @@ set up.
 justIN allows workflows to consist of multiple stages, but you can create
 single stage workflows with the simple-workflow subcommand:
 
-    justin simple-workflow --monte-carlo 10 --jobscript-id testpro:hello-world
+    justin simple-workflow --monte-carlo 10 \
+      --jobscript-git DUNE/dune-justin/testing/hello-world.jobscript:01.00.00
 
-If you execute this command now, justIN will take the jobscript
-testpro:hello-world from justIN's Jobscripts Library
+If you execute this command now, justIN will take 
+hello-world.jobscript from the 
+[01.00.00 tag of the justIN repo in GitHub](https://github.com/DUNE/dune-justin/tree/01.00) 
 and execute it in 10 jobs which require no input data
-files (as if they were Monte Carlo jobs that start from scratch.) Normally 
+files (as if they were Monte Carlo jobs that start from scratch.) 
+This mechanism allows you and your group to manage jobscripts in your own 
+GitHub repos, with proper versioning, tags, branches etc.
+
+Normally 
 stages have a list of real input files on storages to process, but for cases
 where we want to run a certain number of jobs without inputs from storage,
 justIN creates virtual counter files for you, and allocates these to jobs
@@ -84,7 +91,8 @@ find logs, jobs status etc. Please take note of that ID now.
 
 You can use
 
-    justin show-jobscript --jobscript-id testpro:hello-world
+    justin show-jobscript \
+       --jobscript-git DUNE/dune-justin/testing/hello-world.jobscript:01.00.00
 
 to display the script these 10 jobs are running for you. And 
 
@@ -97,7 +105,7 @@ WORKFLOW_ID with the number displayed by simple-workflow.
 
 The two show subcommands are useful for simple checks, but to look at workflows
 and jobs in detail you need to use the 
-[justIN dashboard](https://justin.dune.hep.ac.uk/dashboard/). Go there
+[justIN dashboard](https://dunejustin.fnal.gov/dashboard/). Go there
 and look for the Workflows link in the blue navigation the strip at the top of
 the page. The workflow you launched will be listed there, with the WORKFLOW_ID
 shown by the simple-workflow subcommand when you ran it.
@@ -132,23 +140,25 @@ how to repeat part of it. We'll run LArSoft to process some data that is
 registered in MetaCat and Rucio, and temporarily store the output files in
 Rucio-managed storage at remote sites.
 
-To start with, run this command to view the dc4-vd-coldbox-bottom:default
+To start with, run this command to view the dc4-vd-coldbox-bottom.jobscript
 jobscript:
 
-    justin show-jobscript --jobscript-id dc4-vd-coldbox-bottom:default
+    justin show-jobscript --jobscript-git \
+      DUNE/dune-justin/testing/dc4-vd-coldbox-bottom.jobscript:01.00.00
 
 The comments at the top explain how to use the jobscript to process some
 VD coldbox files. For this tutorial though, please use these commands:
 
-    MQL_QUERY=\
-    "files from dune:all where core.run_type='dc4-vd-coldbox-bottom' "\
-    "and dune.campaign='dc4' limit 10" 
+    MQL_QUERY="files from justin-tutorial:justin-tutorial-2024 limit 10"
     
     justin simple-workflow \
     --mql "$MQL_QUERY" \
-    --jobscript-id dc4-vd-coldbox-bottom:default --max-distance 30 \
-    --rss-mb 4000 --env NUM_EVENTS=1 --scope usertests \
-    --output-pattern '*_reco_data_*.root:output-test-01'
+    --jobscript-git \
+       DUNE/dune-justin/testing/dc4-vd-coldbox-bottom.jobscript:01.00.00 \
+    --max-distance 30 \
+    --rss-mib 4000 --env NUM_EVENTS=1 --scope usertests \
+    --output-pattern '*_reco_data_*.root:output-test' \
+    --lifetime-days 1
     
 What is this doing?
 
@@ -159,11 +169,11 @@ quotes to MetaCat and get a list of matching files. In this case, only the
 first 10 matching files are returned. To make it easier to read we've put
 the query in `$MQL_QUERY` but you could put it in quotes on the `justin`
 command line itself.
-3. `--jobscript-id` tells justIN to use the jobscript we've been looking at.
+3. `--jobscript-git` tells justIN to use the jobscript we've been looking at.
 4. `--max-distance 30` says that only replicas of files within a distance of
 30 from where the job is running will be considered. In practice, 30 means 
 within North America or within Europe, but not from one to the other. 
-5. `--rss-mb 4000` asks for 4000 MiB of memory. Since `--processors` is not
+5. `--rss-mib 4000` asks for 4000 MiB of memory. Since `--processors` is not
 given, the default of 1 processor is workflowed.
 6. `--env NUM_EVENTS=1` sets the environment variable NUM_EVENTS. If you
 look back at the jobscript you will see this variable causes LArSoft to
@@ -171,11 +181,17 @@ process just 1 event from the input file it is given.
 7. `--scope usertests` says that output files will be created with the Rucio
 scope usertests, which any DUNE member can write to. Output files will be
 created with Rucio Data Identifiers (DIDs) like usertests:aaaa.root
-8. `--output pattern '*_reco_data_*.root:output-test-01'` tells justIN to
+8. `--output pattern '*_reco_data_*.root:output-test'` tells justIN to
 look for output files matching the shell wildcard expression
 `*_reco_data_*.root` in the working directory of the jobscript, when it
-finishes. `output-test-01` is the name of a Rucio dataset to add the output
-files to, and the full name of that dataset is `usertests:output-test-01`.
+finishes. `output-test` is the prefix to a name of a Rucio dataset to 
+add the output
+files to, and the full name of that dataset is `usertests:output-test` 
+plus `-wXXXXs1p1` where XXXX is the ID number of the workflow created. Make
+sure each file put into storage has a unique filename, otherwise the
+outputting step will fail. 
+9. `--lifetime-days` says that the output files are only guaranteed to persist
+on storage for 1 day.
 
 The command doesn't tell justIN where to put the output files. There are
 options to try to steer outputs to particular groups of storages, but with
@@ -192,6 +208,104 @@ Once all the files get to terminal states (processed, failed etc) then
 justIN sets the state of the workflow itself to finished and stops allocating
 any more jobs to it.
 
+## Fetching files from Rucio managed storage
+
+Leave the Apptainer container if you are already in one. To use Rucio 
+do these setup steps:
+
+    /cvmfs/dune.opensciencegrid.org/products/dune/justin/justin-sl7-setup
+    source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
+    setup python v3_9_15
+    setup rucio
+    setup justin
+
+This changes the Python version to one needed by `rucio`, and tells `justin`
+to use the same one.
+
+You should be able to continue using the same justIN session you've already
+setup but the `justin` command will ask you to authorize a new sesssion if
+necessary. But to use the `rucio` command and storage, you also need an X.509
+VOMS Proxy. You can get one from justIN that gives read-only access with this 
+command:
+
+    justin get-token
+
+The proxy will normally be created in `/tmp/x509up_uXXXXX` where XXXXX is your
+Unix user ID, given by `id -u` .
+This also gets you a DUNE WLCG Token and eventually the X.509 feature will 
+be dropped from it. You need to tell `rucio` to use the DUNE read-only account
+and then you can start running `rucio` commands:
+
+    export RUCIO_ACCOUNT=justinreadonly
+    rucio whoami
+    rucio list-scopes
+
+When your jobs finish, the list of files they have each outputted is shown on 
+the pages for the individual jobs which we talked about earlier. You can
+download one or two from Rucio managed storage with the `rucio get`
+subcommand.
+
+Since I don't know what your output files will be called, let's use one of
+the input files as an example, and run the command in a personal temporary
+directory:
+
+    mkdir -p /tmp/$USER
+    cd /tmp/$USER
+    rucio get justin-tutorial:tut_np02bde_307160127\
+    _np02_bde_coldbox_run012352_0057_20211216T001236.hdf5
+
+This file is about 4GB in size so it takes a few seconds to fetch. Some of
+the Rucio error messages look alarming but let the command finish. The
+`rucio` command finds the list of replicas of that file and picks one 
+replica to download. It puts it in subdirectory named after the scope
+`justin-tutorial`.
+
+## Jobs using GPUs ##
+
+It's very easy to access NVIDIA GPUs on the grid using justIN: just add the
+`--gpu` option to the `justin simple-workflow` command and the jobs for your
+workflow will be directed to machines with GPUs and one GPU will be
+requested for each job.
+
+In more detail, the full command to submit a "Hello GPU" workflow looks like
+this:
+
+    justin simple-workflow --monte-carlo 10 --gpu \
+      --jobscript-git DUNE/dune-justin/testing/hello-gpu.jobscript:01.04.rc0
+
+You could add more options to save output files as we did already, but for now
+just submit the workflow and look at the jobscript logs on the justIN 
+dashboard.
+Due to the finite number of GPUs available on the grid, you might find that
+sometimes a workflow starts within minutes, but if you're really unlucky it
+might take hours to find enough free slots.
+
+The jobscript you've used is very similar to the Hello World one we started
+with, but has two extra GPU lines:
+
+    printenv | grep -i cuda
+    nvidia-smi
+
+These print out all the environment variables with variants of CUDA in the
+name. The important one is based on what the GlideInWMS pilot job tells
+justIN and looks something like this:
+
+    CUDA_VISIBLE_DEVICES=GPU-3ae786cc-80fb-24fd-16ad-8191bd0341d2
+
+That environment varible is used by CUDA applications to decide which GPUs to
+use if more than one is available. Please don't try to override that in your
+jobscript.
+
+The next command is the `nvidia-smi` utility which tells you more about the
+GPUs that are available on the machine, including the one you can use. It
+shows details of the model, memory usage, and even things like temperature.
+
+If you have a GPU enabled application that uses CUDA, it should be
+straightforward to get it running in a justIN workflow. Apptainer and the
+GlideInWMS pilot make sure the NVIDIA libraries installed on the worker
+node, including the non-free software, is available to your jobs through
+`$LD_LIBRARY_PATH` and the special directory `/.singularity.d/libs/` 
+
 ## Jobs writing to scratch ##
 
 Instead of uploading outputs to Rucio-managed storage, it's also possible to
@@ -202,7 +316,7 @@ EOS scratch space at CERN in the future.
 To follow this section of the tutorial you do not strictly need to be logged
 in to a dunegpvm machine at Fermilab, as you can access files on scratch 
 remotely using GFAL tools. However, it is easier to check from a dunegpvm
-machine as you can look in /pfns/dune/scratch/users/$USER where $USER is your
+machine as you can look in /pnfs/dune/scratch/users/$USER where $USER is your
 Fermilab username using Unix commands. 
 
 We can adapt the DC4 example from the previous section to use scratch for
@@ -211,14 +325,14 @@ Fermilab username.
 
     USERF=$USER
     FNALURL='https://fndcadoor.fnal.gov:2880/dune/scratch/users'
-    MQL_QUERY=\
-    "files from dune:all where core.run_type='dc4-vd-coldbox-bottom' "\
-    "and dune.campaign='dc4' limit 10" 
+    MQL_QUERY="files from justin-tutorial:justin-tutorial-2024 limit 10" 
     
     justin simple-workflow \
     --mql "$MQL_QUERY" \
-    --jobscript-id dc4-vd-coldbox-bottom:default --max-distance 30 \
-    --rss-mb 4000 --env NUM_EVENTS=1 \
+    --jobscript-git \
+       DUNE/dune-justin/testing/dc4-vd-coldbox-bottom.jobscript:01.00.00 \
+    --max-distance 30 \
+    --rss-mib 4000 --env NUM_EVENTS=1 \
     --output-pattern "*_reco_data_*.root:$FNALURL/$USERF"
 
 If you are on a dunegpvm machine, you can view the output directory
@@ -256,19 +370,9 @@ using the same `setup justin` command as for `justin` itself. It's not
 necessary to have Apptainer or Singularity installed as the command gets
 Apptainer from cvmfs.
 
-If your jobscript reads from remote storage, you also need to have a valid
-DUNE VOMS proxy created with voms-proxy-init. On a dunegpvm computer
-do something like this:
-
-    rm -f /tmp/x509up_u`id -u`
-    kx509
-    voms-proxy-init -noregen -rfc -voms dune:/dune/Role=Analysis
-
-If you normally do something else to run `voms-proxy-init` and get a VOMS
-proxy with the Analysis role, then do that.
-
-`justin-test-jobscript` will pass this proxy to
-your jobscript using the environment variable `$X509_USER_PROXY`. Commands like
+`justin-test-jobscript` will obtain a DUNE VOMS proxy for your script,
+just as justIN does for jobscripts running as jobs. The proxy file path
+is given by the environment variable `$X509_USER_PROXY`. Commands like
 `xrdcp` and `lar` use this variable to find the proxy automatically. You
 should not try to write to storage from your jobscript though. In jobs,
 justIN handles that for you using the `--output-pattern` mechanism and the
@@ -278,7 +382,8 @@ Let's rerun the Data Challenge 4 jobscript we used in the previous section,
 but this time use a local file and run it interactively. First get a copy
 of the jobscript in your current directory:
 
-    justin show-jobscript --jobscript-id dc4-vd-coldbox-bottom:default \
+    justin show-jobscript --jobscript-git \
+      DUNE/dune-justin/testing/dc4-vd-coldbox-bottom.jobscript:01.00.00 \
       > my-dc4-vd-coldbox-bottom.jobscript
 
 Have a look at it with your favourite text editor and maybe add an extra
@@ -290,9 +395,7 @@ line  before the fcl file comment. So it reads:
 Now run it with `justin-test-jobscript`. All of the files it creates are
 made under /tmp in the directory name it prints out.
 
-    MQL_QUERY=\
-    "files from dune:all where core.run_type='dc4-vd-coldbox-bottom' "\
-    "and dune.campaign='dc4' limit 10" 
+    MQL_QUERY="files from justin-tutorial:justin-tutorial-2024 limit 10" 
     
     justin-test-jobscript --mql "$MQL_QUERY" \
      --jobscript my-dc4-vd-coldbox-bottom.jobscript \
@@ -310,19 +413,18 @@ delete the directory in /tmp when you're finished.
 If you want to test your jobscript running in real jobs, you can repeat the
 simple-workflow with these options:
 
-    MQL_QUERY=\
-    "files from dune:all where core.run_type='dc4-vd-coldbox-bottom' "\
-    "and dune.campaign='dc4' limit 10" 
+    MQL_QUERY="files from justin-tutorial:justin-tutorial-2024 limit 10" 
     
     justin simple-workflow \
     --mql "$MQL_QUERY" \
     --jobscript my-dc4-vd-coldbox-bottom.jobscript --max-distance 30 \
-    --rss-mb 4000 --env NUM_EVENTS=1 --scope usertests \
-    --output-pattern '*_reco_data_*.root:output-test-01'
+    --rss-mib 4000 --env NUM_EVENTS=1 --scope usertests \
+    --output-pattern '*_reco_data_*.root:output-test' \
+    --lifetime-days 1
 
-As you can see, you just need to change 
-`--jobscript-id dc4-vd-coldbox-bottom:default` to the 
-option `--jobscript my-dc4-vd-coldbox-bottom.jobscript` 
+As you can see, you just need to change the whole
+`--jobscript-git` option to 
+`--jobscript my-dc4-vd-coldbox-bottom.jobscript` 
 to use the local file as the jobscript.
     
 ## Rapid Code Distribution to jobs via cvmfs
@@ -341,7 +443,8 @@ This section shows you how to do this for justIN jobs too, using the
 using the same `setup justin` command as for `justin` itself.
 
 First, you need to make a tar file containing the files you want to include.
-You don't need to be on a Fermilab computer for this step.
+You don't need to be on a Fermilab computer for this step but you **must**
+make a tar file, not one file by itself or a tar.gz file.
 
     mkdir somedir
     cd somedir
@@ -361,16 +464,15 @@ up like this if not already done so:
 
 and a copy of `hello_world.tar` in the current directory, do this:
 
-    rm -f /tmp/x509up_u`id -u`
-    kx509
+    justin get-token
     INPUT_TAR_DIR_LOCAL=`justin-cvmfs-upload hello_world.tar`
     echo $INPUT_TAR_DIR_LOCAL
 
-The first two lines make sure you have a valid X.509 proxy in place. If you
-need a VOMS proxy later on you'll need to rerun that too, but it's not
-needed for the rest of the tutorial.
+The first line makes sure you have a Bearer Token in place (probably at
+/run/users/UID/bt_uUID where UID is your Unix user ID.) You don't need to
+know your UID to use the command but it might help with debugging.
 
-The third line runs `justin-cvmfs-upload` to send your tar file to the RCDS
+The second line runs `justin-cvmfs-upload` to send your tar file to the RCDS
 server. It waits until RCDS has unpacked the tar file and then puts the cvmfs
 directory in which it was unpacked in the environment variable 
 `$INPUT_TAR_DIR_LOCAL` You can use any name you like for that but I've
@@ -405,8 +507,9 @@ just hard code it in your jobscripts. But it's simpler to pass the
 environment variable itself to jobscripts. 
 
 Look at this example jobscript:
-
-    justin show-jobscript --jobscript-id testpro:cvmfs-hello-world
+ 
+    justin show-jobscript --jobscript-git \
+      DUNE/dune-justin/testing/cvmfs-hello-world.jobscript:01.00.00
 
 The important lines are right at the end:
 
@@ -422,7 +525,8 @@ This command creates a workflow to run it:
 
     justin simple-workflow --monte-carlo 1 \
      --env INPUT_TAR_DIR_LOCAL="$INPUT_TAR_DIR_LOCAL" \
-     --jobscript-id testpro:cvmfs-hello-world
+     --jobscript-git \
+        DUNE/dune-justin/testing/cvmfs-hello-world.jobscript:01.00.00
 
 The `--env` line takes the `$INPUT_TAR_DIR_LOCAL` value from your computer
 and then tells justIN to set an environment variable with the same name
@@ -433,7 +537,7 @@ Try this now and look at the output through the dashboard.
 ## More information
 
 There is a lot more about justIN in the docs area at
-[https://justin.dune.hep.ac.uk/docs/](https://justin.dune.hep.ac.uk/docs/)
+[https://dunejustin.fnal.gov/docs/](https://dunejustin.fnal.gov/docs/)
 
 When you `setup justin`, you also get the justin, justin-test-jobscript,
 and justin-cvmfs-upload  man pages.

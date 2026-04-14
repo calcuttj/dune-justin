@@ -1,0 +1,17 @@
+# Install in /usr/lib/systemd/system
+[Unit]
+Description=justIN Job Factory 
+After=sshd.service
+#Requires=podman.service
+
+[Service]
+Type=simple
+TimeoutStartSec=0
+Restart=always
+ExecStartPre=-/usr/bin/podman stop %N
+ExecStartPre=-/usr/bin/podman rm %N
+ExecStart=/usr/sbin/justin-podman-wrapper justin-job-factory
+
+[Install]
+WantedBy=multi-user.target
+ 

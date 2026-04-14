@@ -1,7 +1,7 @@
 #
 # justin-wsgi-ui - justIN commands and info API service
 #
-# Copyright 2013-23, Andrew McNab for the University of Manchester
+# Copyright 2013-25, Andrew McNab for the University of Manchester
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,14 +22,24 @@
 import os
 import re
 import sys
+import ssl
 import time
 import json
 import string
 import socket
+import urllib
 import secrets
+import tempfile
 import datetime
+import subprocess
 import urllib.request
 import rucio.client
+import rucio.client.downloadclient
+
+#import M2Crypto
+
+# After 0.39.0, M2Crypto needs "from M2Crypto import" syntax 
+from M2Crypto import RSA,BIO,X509,ASN1,EVP
 
 import justin
 
@@ -136,51 +146,75 @@ def showStagesCmd(startResponse, jsonDict):
 
 def showJobscriptCmd(startResponse, jsonDict):
 
-  try:
-    jsid = jsonDict['jobscript_id'].lower()
-  except:
-    jsid = None
+  gitPathTag = jsonDict.get('jobscript_git', '')
 
-  try:
-    workflowID = int(jsonDict['workflow_id'])
-  except:
-    workflowID = 0
+  if gitPathTag:
+    # git reference given, so try to go with that
 
-  try:
-    stageID = int(jsonDict['stage_id'])
-  except:
-    stageID = 0
+    if not justin.stringIsURL(gitPathTag):
+      return ('400 Bad Request', 
+              'GitHub reference must be just ORG/PATH/../FILE:TAG')
+    try:
+      (orgRepoPath, tag) = gitPathTag.split(':', 1)
+      (org, repo, path)  = orgRepoPath.split('/', 2)
+    except:
+      return ('400 Bad Request', 
+              'GitHub reference must be ORG/PATH/../FILE:TAG')
 
-  if (jsid and (workflowID or stageID)) or \
-     (not jsid and (not workflowID or not stageID)):
-    return httpError(startResponse,
-                     '400 Bad Request', 
-          '--jobscript-id OR --workflow-id/--stage-id must be given')
+    jobscriptGit = '%s/%s/%s:%s' % (org, repo, path, tag)
 
-  if jsid:
-    # From Jobscripts Library with JSID
-    response = justin.lookupJobscript(jsid)
-    
-    if response['error']:
-      return httpError(startResponse,
-                       '400 Bad Request', 
-                       response['error'])
-      
-    jobscript = response['jobscript']
+    url = ('https://raw.githubusercontent.com/%s/%s/%s/%s' 
+           % (org, repo, tag, path))
+    httpRequest  = urllib.request.Request(url)
+    sslContext                = ssl.SSLContext()
+#    sslContext.verify_mode    = ssl.CERT_REQUIRED
+#    sslContext.check_hostname = True
+
+    try:
+      response = urllib.request.urlopen(httpRequest, context = sslContext)
+    except Exception as e:
+      return ('400 Bad Request', 
+              'Get jobscript from GitHub URL %s fails: %s' % (url, str(e)))
+
+    if response.status != 200:
+      return ('400 Bad Request', 
+              'Get jobscript response not 200, code=%d' % response.status)
+
+    try:
+      jobscript = response.read().decode('utf-8')
+    except Exception as e:
+      return ('400 Bad Request', 'Failed to get jobscript from response')
 
   else:
+    # No git reference, so try workflow/stage
+
+    try:
+      workflowID = int(jsonDict['workflow_id'])
+    except:
+      workflowID = 0
+
+    try:
+      stageID = int(jsonDict['stage_id'])
+    except:
+      stageID = 0
+
+    if not workflowID or not stageID:
+      return httpError(startResponse,
+                       '400 Bad Request', 
+       'Either --jobscript-git or --workflow-id and --stage-id must be given')
+
     # From stage with workflowID and stageID
     query = ('SELECT jobscript FROM stages_jobscripts '
-             'WHERE workflow_id=%d AND stage_id=%d'
-             % (workflowID, stageID))
+              'WHERE workflow_id=%d AND stage_id=%d'
+              % (workflowID, stageID))
   
     try:
       row = justin.select(query, justOne = True)
       jobscript = row['jobscript']
     except Exception as e:
       return httpError(startResponse, 
-                      '500 Internal Server Error', 
-                      'Error reading justIN database ' + str(e))
+                       '500 Internal Server Error', 
+                       'Error reading justIN database ' + str(e))
 
   if not jobscript.endswith('\n'):
     jobscript += '\n'
@@ -203,7 +237,7 @@ def showStageOutputsCmd(startResponse, jsonDict):
     rows = justin.select("SELECT for_next_stage,"
                             "scopes.scope_name,"
                             "file_pattern,"
-                            "destination "
+                            "destination,pattern_id "
                             "FROM stages_outputs "
                             "LEFT JOIN workflows "
                             "ON workflows.workflow_id=stages_outputs.workflow_id "
@@ -211,7 +245,7 @@ def showStageOutputsCmd(startResponse, jsonDict):
                             "ON workflows.scope_id=scopes.scope_id "
                             "WHERE stages_outputs.workflow_id=%d "
                             "AND stages_outputs.stage_id=%d "
-                            "ORDER BY destination,file_scope,file_pattern" 
+                            "ORDER BY pattern_id" 
                             % (workflowID, stageID))
   except Exception as e:
     return httpError(startResponse, 
@@ -233,9 +267,8 @@ def queryMetaCat(mql):
 
   try:
     response = urllib.request.urlopen(
-              "https://metacat.fnal.gov:9443/dune_meta_prod/app/data/query?"
-              "with_meta=no&with_provenance=no",
-              data = mql.encode() )
+                  "%s/data/query?with_meta=no&with_provenance=no" 
+                  % justin.metacatServerInputsURL, data = mql.encode() )
 
     if response.status != 200:
       print("Reading files list from MetaCat for %s fails with HTTP code %d"
@@ -488,41 +521,94 @@ def createWorkflow(jsonDict, user, simple = False):
               'Monte Carlo option requires an integer count')
 
   if 'scope' in jsonDict and jsonDict['scope']:
-    # --scope option given, so check the scope is known
     scopeName = jsonDict['scope'].lower()
   else:
     scopeName = justin.defaultScopeName
 
-  if not justin.stringIsDomain(scopeName):
+  if not justin.stringIsScope(scopeName):
       return ('400 Bad Request', 
               'Scope name can only be characters a-z 0-9 - _ .')
 
   try:
-      scopeRow = justin.select('SELECT scope_id,wlcg_group_name,'
-                          'condor_group_id '
-                          'FROM scopes '
-                          'LEFT JOIN wlcg_groups '
-                          'ON wlcg_groups.wlcg_group_id=scopes.wlcg_group_id '
-                          'WHERE scope_name="%s"' % scopeName, 
-                          justOne=True)
+      scopeRow = justin.select('SELECT scope_id,wlcg_group_name,quota_name,'
+                    'principal_name,scopes.quota_id '
+                    'FROM scopes '
+                    'LEFT JOIN named_quotas '
+                    'ON named_quotas.quota_id=scopes.quota_id '
+                    'LEFT JOIN users '
+                    'ON users.user_id=named_quotas.user_id '
+                    'LEFT JOIN principal_names '
+                    'ON principal_names.pn_id=users.main_pn_id '
+                    'LEFT JOIN wlcg_groups '
+                    'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                    'WHERE scope_name="%s"' % scopeName, 
+                    justOne=True)
 
-      wlcgGroupName = scopeRow['wlcg_group_name']
-      condorGroupID = int(scopeRow['condor_group_id'])
-      scopeID       = int(scopeRow['scope_id'])
+      scopeQuotaID   = int(scopeRow['quota_id'])
+      quotaName      = scopeRow['quota_name']
+      wlcgGroupName  = scopeRow['wlcg_group_name']
+      principalName  = scopeRow['principal_name']
+      scopeID        = int(scopeRow['scope_id'])
       if not scopeID:
         raise
   except:
       return ('400 Bad Request', 
-              'Failed to find scope %s in justIN database' % scope)
- 
-  if not wlcgGroupName:
-      return ('403 Forbidden', 
-              'Scope %s has no group defined and cannot yet be used via justIN'  
-              % scopeName)
+              'Failed to find scope %s in justIN database' % scopeName)
 
-  if wlcgGroupName not in user['wlcg_groups']:
+  if not quotaName:
       return ('403 Forbidden', 
-              'You need to be in group %s to use scope %s' % (wlcgGroupName, scopeName))
+       'Scope %s has no named quota defined and cannot yet be used via justIN'
+       % scopeName)
+
+  # Check authorization to do this
+  if wlcgGroupName:
+    # Needs a WLCG group, check if the user has it
+    if wlcgGroupName not in user['wlcg_groups']:
+      return ('403 Forbidden', 
+              'You need to be in group %s to use scope %s' 
+              % (wlcgGroupName, scopeName))
+
+  elif principalName != user['user_name']:
+    # Needs user but name doesn't match
+    return ('403 Forbidden', 
+            'You need to be %s to use scope %s' 
+              % (principalName, scopeName))
+
+  if 'campaign_id' not in jsonDict or not jsonDict['campaign_id']:
+    campaignID = 0
+  else:
+    try: 
+      campaignID = int(jsonDict['campaign_id'])
+    except:
+      return('400 Bad Request', '--campaign-id must give an integer')
+  
+  if campaignID == 0:
+    # No campaign ID given, so create a new campaign
+    try:
+      campaignID = justin.insertUpdate('INSERT INTO campaigns SET '
+                                       'created=NOW(),'
+                                       'quota_id=%d,'
+                                       'user_id=%d'
+                                       % (scopeQuotaID, user['user_id']))
+    except Exception as e:
+      return ('500 Internal Server Error', 
+              'Error creating new campaign for workflow: ' + str(e))
+  else:
+    try:
+      campaignRow = justin.select('SELECT quota_id FROM campaigns '
+                                  'WHERE campaign_id=%d' % campaignID,
+                                  justOne=True)
+      campaignQuotaID = int(campaignRow['quota_id'])
+    except:
+      return ('400 Bad Request', 
+              'Failed to find campaign %d in justIN database' % campaignID)
+
+    # Check the user can use that campaign, via the scope's named quota that
+    # we have already checked
+    if scopeQuotaID != campaignQuotaID:
+      return ('403 Forbidden', 
+ 'The campaign ID %d and scope %s you gave are owned by different named quotas'
+              % (campaignID, scopeName))
 
   refindEnd     = justin.unixEpoch
   refindSeconds = 0
@@ -560,26 +646,33 @@ def createWorkflow(jsonDict, user, simple = False):
   try:
     workflowID = justin.insertUpdate('INSERT INTO workflows SET created=NOW(),'
           'state="%s",'
+          'state_message="Created by %s",'
           '%s'
           'description="%s",'
           'mql="%s",'
           'scope_id=%d,'
-          'condor_group_id=%d,'
+          'campaign_id=%d,'
           'user_id=%d,'
           'refind_seconds=%d,'
           'refind_end_time="%s" '
           % ('submitted' if simple else 'draft',
+             user['user_name'],
              'submitted=NOW(),' if simple else '',
              description,
              mql,
              scopeID,
-             condorGroupID,
+             campaignID,
              user['user_id'],
              refindSeconds,
              refindEnd))
   except Exception as e:
     return ('500 Internal Server Error', 
             'Error creating workflow: ' + str(e))
+
+#  if justin.instance not in ['fnal' and workflowID >= 1000:
+#    return ('500 Internal Server Error', 
+#            'The %s database needs resetting - too many workflows created' 
+#            % justin.instance)
 
   return ('200 OK', workflowID)
 
@@ -615,6 +708,78 @@ def simpleWorkflowCmd(startResponse, jsonDict, user):
   # We output the message from the workflow creation
   return httpOK(startResponse, str(workflowMessage) + '\n')
 
+def createCampaignCmd(startResponse, jsonDict, user):
+
+  if 'description' in jsonDict and jsonDict['description']:
+    description = jsonDict['description']
+  else:
+    description = ''
+
+  if 'quota' in jsonDict and jsonDict['quota']:
+    quotaName = jsonDict['quota'].lower()
+  else:
+# HARD CODE THIS FOR NOW BECAUSE THE DEFAULT WILL BECOME PEOPLE'S 
+# PER-USER NAMED QUOTA
+    quotaName = 'usertests'
+
+  if not justin.stringIsScope(quotaName):
+      return httpError(startResponse, '400 Bad Request', 
+              'Quota name can only be characters a-z 0-9 _')
+
+  try:
+      quotaRow = justin.select('SELECT quota_id,wlcg_group_name,quota_name,'
+                    'principal_name,named_quotas.quota_id '
+                    'FROM named_quotas '
+                    'LEFT JOIN users '
+                    'ON users.user_id=named_quotas.user_id '
+                    'LEFT JOIN principal_names '
+                    'ON principal_names.pn_id=users.main_pn_id '
+                    'LEFT JOIN wlcg_groups '
+                    'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                    'WHERE quota_name="%s"' % quotaName, 
+                    justOne=True)
+
+      quotaName      = quotaRow['quota_name']
+      wlcgGroupName  = quotaRow['wlcg_group_name']
+      principalName  = quotaRow['principal_name']
+      quotaID        = int(quotaRow['quota_id'])
+      if not quotaID:
+        raise
+  except Exception as e:
+      print('Quota query error: ' + str(e), file=sys.stderr)
+      return httpError(startResponse, '400 Bad Request', 
+              'Failed to find quota %s in justIN database' % quotaName)
+
+  # Check authorization to do this
+  if wlcgGroupName:
+    # Needs a WLCG group, check if the user has it
+    if wlcgGroupName not in user['wlcg_groups']:
+      return httpError(startResponse, '403 Forbidden', 
+              'You need to be in group %s to use quota %s' 
+              % (wlcgGroupName, quotaName))
+
+  elif principalName != user['user_name']:
+    # Needs user but name doesn't match
+    return httpError(startResponse, '403 Forbidden', 
+                     'You need to be %s to use quota %s' 
+                     % (principalName, quotaName))
+
+  try:
+    campaignID = justin.insertUpdate('INSERT INTO campaigns SET created=NOW(),'
+          'description="%s",'
+          'quota_id=%d,'
+          'user_id=%d '
+          % (description,
+             quotaID,
+             user['user_id']))
+  except Exception as e:
+    return httpError(startResponse, '500 Internal Server Error', 
+                     'Error creating campaign: ' + str(e))
+
+  return httpOK(startResponse, str(campaignID) + '\n')
+
+#  return httpError(startResponse, code, message)
+
 def modifyWorkflowCmds(startResponse, jsonDict, user):
   # Generic handler for restart-workflow, submit-workflow, pause-workflow and
   # finish-workflow
@@ -628,13 +793,15 @@ def modifyWorkflowCmds(startResponse, jsonDict, user):
 
   try:
     row = justin.select('SELECT workflows.user_id,workflows.state,'
-                        'wlcg_group_name FROM workflows '
-                        'LEFT JOIN scopes '
-                        'ON scopes.scope_id=workflows.scope_id '
-                        'LEFT JOIN wlcg_groups '
-                        'ON wlcg_groups.wlcg_group_id=scopes.wlcg_group_id '
-                        'WHERE workflows.workflow_id=%d' % workflowID,
-                        justOne = True)
+                    'wlcg_group_name FROM workflows '
+                    'LEFT JOIN scopes '
+                    'ON scopes.scope_id=workflows.scope_id '
+                    'LEFT JOIN named_quotas '
+                    'ON scopes.quota_id=named_quotas.quota_id '
+                    'LEFT JOIN wlcg_groups '
+                    'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                    'WHERE workflows.workflow_id=%d' % workflowID,
+                    justOne = True)
 
     workflowUserID = int(row['user_id'])
     workflowState  = row['state']
@@ -645,6 +812,7 @@ def modifyWorkflowCmds(startResponse, jsonDict, user):
                      'Database error: ' + str(e))
   
   if workflowUserID != user['user_id'] and \
+     user['user_name'] not in justin.justinAdmins and \
      wlcgGroupName not in user['wlcg_groups']:
     return httpError(startResponse,
                      '403 Forbidden',
@@ -658,9 +826,9 @@ def modifyWorkflowCmds(startResponse, jsonDict, user):
 
     # Submitting updates user_id to the person who actually submitted it
     query = ("UPDATE workflows SET "
-             "state='submitted',submitted=NOW(),user_id=%d "
+             "state='submitted',state_message='',submitted=NOW(),user_id=%d "
              "WHERE workflow_id=%d AND state='draft'" 
-             % (workflowID, user['user_id']))
+             % (user['user_id'], workflowID))
 
   elif jsonDict['command'] == 'restart-workflow':
     if workflowState != 'paused':
@@ -668,9 +836,10 @@ def modifyWorkflowCmds(startResponse, jsonDict, user):
                        '403 Forbidden',
                        'You cannot restart a workflow that is not paused')
 
-    query = ("UPDATE workflows SET state='running' "
+    query = ("UPDATE workflows SET state='running',"
+             "state_message='Restarted by %s' "
              "WHERE workflow_id=%d AND state='paused'"
-             % workflowID)
+             % (user['user_name'], workflowID))
 
   elif jsonDict['command'] == 'pause-workflow':
     if workflowState != 'running':
@@ -678,19 +847,22 @@ def modifyWorkflowCmds(startResponse, jsonDict, user):
                        '403 Forbidden',
                        'You cannot pause a workflow that is not running')
 
-    query = ("UPDATE workflows SET state='paused' "
+    query = ("UPDATE workflows SET state='paused',"
+             "state_message='Paused by %s' "
              "WHERE workflow_id=%d "
-             "AND state='running'" % workflowID)
+             "AND state='running'" % (user['user_name'], workflowID))
 
   elif jsonDict['command'] == 'finish-workflow':
-    if workflowState != 'running' and workflowState != 'submitted':
+    if workflowState not in ('running','submitted','draft'):
       return httpError(startResponse,
                        '403 Forbidden',
                        'You cannot finish a workflow that is not running')
 
-    query = ("UPDATE workflows SET state='finished',finished=NOW() "
+    query = ("UPDATE workflows SET state='finished',finished=NOW(),"
+             "state_message='Finished by %s' "
              "WHERE workflow_id=%d "
-             "AND (state='running' OR state='submitted')" % workflowID)
+             "AND (state='running' OR state='submitted' OR state='draft')" 
+             % (user['user_name'], workflowID))
 
   try:
     justin.insertUpdate(query)
@@ -712,18 +884,21 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
     # Check reference is to a valid existing workflow
     try:
       workflowRow = justin.select('SELECT workflows.scope_id,scope_name,'
-                           'wlcg_group_name,workflows.user_id FROM workflows '
-                           'LEFT JOIN scopes '
-                           'ON scopes.scope_id=workflows.scope_id '
-                           'LEFT JOIN wlcg_groups '
-                           'ON wlcg_group.wlcg_group_id=scopes.wlcg_group_id '
-                           'WHERE workflow_id=%d' % workflowID, 
-                           justOne = True)
+                     'wlcg_group_name,workflows.user_id FROM workflows '
+                     'LEFT JOIN scopes '
+                     'ON scopes.scope_id=workflows.scope_id '
+                     'LEFT JOIN named_quotas '
+                     'ON scopes.quota_id=named_quotas.quota_id '
+                     'LEFT JOIN wlcg_groups '
+                     'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                     'WHERE workflow_id=%d' % workflowID, 
+                     justOne = True)
       workflowUserID = int(workflowRow['user_id'])
       scopeID       = int(workflowRow['scope_id'])
       scopeName     = workflowRow['scope_name']
       wlcgGroupName = workflowRow['wlcg_group_name']
-    except:
+    except Exception as e:
+      print(str(e),file=sys.stderr)
       return ('400 Bad Request', 'Valid workflow ID must be given')
 
     if workflowUserID != user['user_id'] and \
@@ -742,12 +917,17 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
     processors = 1
 
   try:
+    needsGPU = jsonDict['gpu']
+  except:
+    needsGPU = False
+
+  try:
     wallSeconds = int(jsonDict['wall_seconds'])
   except:
     wallSeconds = 80000
 
   try:
-    rssBytes = int(jsonDict['rss_mb']) * 1024 * 1024
+    rssBytes = int(jsonDict['rss_mib']) * 1024 * 1024
   except:
     rssBytes = 2000 * 1024 * 1024
 
@@ -759,42 +939,83 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
   else:
     maxDistance = 0.0
 
-  jobscriptID = 0
+  jobscript    = jsonDict.get('jobscript', '')
+  jobscriptGit = ''
+  gitPathTag   = jsonDict.get('jobscript_git', '')
 
-  try:
-    jobscript = jsonDict['jobscript']
-  except:
-    jobscript = None
+  if not jobscript and gitPathTag:
+    if not justin.stringIsURL(gitPathTag):
+      return ('400 Bad Request', 
+              'GitHub reference must be just ORG/PATH/../FILE:TAG')
+    try:
+      (orgRepoPath, tag) = gitPathTag.split(':', 1)
+      (org, repo, path)  = orgRepoPath.split('/', 2)
+    except:
+      return ('400 Bad Request', 
+              'GitHub reference must be ORG/PATH/../FILE:TAG')
+
+    jobscriptGit = '%s/%s/%s:%s' % (org, repo, path, tag)
+
+    url = ('https://raw.githubusercontent.com/%s/%s/%s/%s' 
+           % (org, repo, tag, path))
+    httpRequest  = urllib.request.Request(url)
+    sslContext                = ssl.SSLContext()
+#    sslContext.verify_mode    = ssl.CERT_REQUIRED
+#    sslContext.check_hostname = True
+
+    try:
+      response = urllib.request.urlopen(httpRequest, context = sslContext)
+    except Exception as e:
+      return ('400 Bad Request', 
+              'Get jobscript from GitHub URL %s fails: %s' % (url, str(e)))
+
+    if response.status != 200:
+      return ('400 Bad Request', 
+              'Get jobscript response not 200, code=%d' % response.status)
+
+    try:
+      jobscript = response.read().decode('utf-8')
+    except Exception as e:
+      return ('400 Bad Request', 'Failed to get jobscript from response')
 
   if not jobscript:
-    try:
-      jsid = jsonDict['jobscript_id']
-    except:
-      jsid = None
+    return ('400 Bad Request',
+            '--jobscript or --jobscript-git must by given')
 
-    if not jsid:
-      return ('400 Bad Request', '--jobscript or --jobscript-id must by given')
-    
-    response = justin.lookupJobscript(jsid)
-    if response['error']:
-      return ('400 Bad Request', response['error'])
+  if jsonDict['image']:
+    # DID is A-Za-z0-9_.:- so good for images. No slashes in particular!
+    if not justin.stringIsDID(jsonDict['image']):
+      return ('400 Bad Request', 'Invalid image name')
 
-    jobscript   = response['jobscript']
-    jobscriptID = response['jobscript_id']
+    if ':' in jsonDict['image']:
+      jobscriptImage = (justin.jobscriptImagePrefix + '/' + 
+                        jsonDict['image'])
+    else:
+      jobscriptImage = (justin.jobscriptImagePrefix + '/' + 
+                        jsonDict['image'] + ':latest')
+  else: 
+    # Just use the defaults specified in the configuration files for now
+    jobscriptImage = (justin.jobscriptImagePrefix + '/' + 
+                      justin.jobscriptImageSuffix + ':' + 
+                      justin.jobscriptImageVersion)
 
   try:
-    justin.insertUpdate("INSERT INTO stages SET "
-                        "stage_priority=50,"
-                        "workflow_id=%d,"
-                        "stage_id=%d,"
-                        "jobscript_id=%d,"
-                        "processors=%d,"
-                        "wall_seconds=%d,"
-                        "rss_bytes=%d,"
-                        "max_distance=%f" 
+    justin.insertUpdate('INSERT INTO stages SET '
+                        'stage_priority=50,'
+                        'workflow_id=%d,'
+                        'stage_id=%d,'
+                        'jobscript_git="%s",'
+                        'jobscript_image="%s",'
+                        'processors=%d,'
+                        'needs_gpu=%s,'
+                        'wall_seconds=%d,'
+                        'rss_bytes=%d,'
+                        'max_distance=%f' 
                         % (workflowID, stageID, 
-                           jobscriptID, processors,
-                           wallSeconds, rssBytes, maxDistance))
+                           jobscriptGit,
+                           jobscriptImage,
+                           processors, needsGPU, wallSeconds, 
+                           rssBytes, maxDistance))
           
     justin.insertUpdate('INSERT INTO stages_jobscripts SET '
                            'workflow_id=%d,'
@@ -813,52 +1034,84 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
   if scopeName:
     justinEnvVars['JUSTIN_SCOPE'] = scopeName
 
+  patternID      = 1
   outputPatterns = []
 
   # check output_pattern is not None then proceed with checks
   if jsonDict['output_pattern']:
-    for i in jsonDict['output_pattern']:
-      try:
-        (pattern, destination) = i.split(':', 1)
-      except:
-        return ('400 Bad Request',
-                'Output patterns must be of the form PATTERN:DESTINATION')
+    for patternDest in jsonDict['output_pattern']:
+      if ':' in patternDest:
+        (pattern, destination) = patternDest.split(':', 1)
+      else:
+        pattern     = patternDest
+        destination = ''
 
-      if not destination.startswith('https://') and not scopeName:
+      if destination.startswith('https://'):
+        destination = justin.expandEnvVars(destination, justinEnvVars)
+        destSplit = destination.split('/')
+        for i in range(2, len(destSplit)):
+          if destSplit[i] == '':
+            destSplit.pop(i)      
+        destination = '/'.join(destSplit)
+
+      elif scopeName:
+        # If to a Rucio dataset, then always [destination-]wXsYpZ
+        if destination:
+          destination += '-'
+
+        destination += '%s-w%ds%dp%d' \
+                       % (justin.instance, workflowID, stageID, patternID)
+        destination = justin.expandEnvVars(destination, justinEnvVars)
+
+      else:
         return ('400 Bad Request', 
                 'A scope must be specified when creating the workflow if '
                 '--output-pattern is given for this stage '
                 'and a Rucio dataset is given.')
 
-      destination = justin.expandEnvVars(destination, justinEnvVars)
-      outputPatterns.append((False, pattern, destination))
+      outputPatterns.append((False, pattern, destination, patternID))
+      patternID += 1
 
   # check output_pattern_next_stage is not None then proceed with checks
   if jsonDict['output_pattern_next_stage']:
-      for i in jsonDict['output_pattern_next_stage']:
-        try:
-          (pattern, destination) = i.split(':', 1)
-        except:
-          return ('400 Bad Request',
-                  'Output patterns must be of the form PATTERN:DESTINATION')
+    for patternDest in jsonDict['output_pattern_next_stage']:
+      if ':' in patternDest:
+        (pattern, destination) = patternDest.split(':', 1)
+      else:
+        pattern     = patternDest
+        destination = ''
+       
+      if not scopeName:
+        return ('400 Bad Request', 
+                'A scope must be specified when creating the workflow if '
+                '--output-pattern-next-stage is given for this stage '
+                'and a Rucio dataset is given.')
 
-        if not scopeName:
-          return ('400 Bad Request', 
-                  'A scope must be specified when creating the workflow if '
-                  '--output-pattern-next-stage is given for this stage '
-                  'and a Rucio dataset is given.')
+      if destination:
+        destination += '-'
 
-        destination = justin.expandEnvVars(destination, justinEnvVars)
-        outputPatterns.append((True, pattern, destination))
+      destination += '%s-w%ds%dp%d' \
+                     % (justin.instance, workflowID, stageID, patternID)
+      destination = justin.expandEnvVars(destination, justinEnvVars)
+      outputPatterns.append((True, pattern, destination, patternID))
+      patternID += 1
     
   try:
     lifetimeDays = int(jsonDict['lifetime_days'])
   except:
     lifetimeDays = 0
 
-  didClient  = rucio.client.didclient.DIDClient()
+  # Store a catch all RSE expression to use when creating rules for 
+  # output datasets other than per-RSE datasets 
+  outputExpression = ''
+  if 'output_rse_expression' in jsonDict \
+     and jsonDict['output_rse_expression']:
+    if not justin.stringIsExpression(jsonDict['output_rse_expression']):
+      return ('400 Bad Request', 'Invalid RSE expression')
+    else:
+      outputExpression = jsonDict['output_rse_expression']
 
-  for (forNextStage, pattern, destination) in outputPatterns:
+  for (forNextStage, pattern, destination, patternID) in outputPatterns:
 
     if not justin.stringIsFilePattern(pattern):
       return ('400 Bad Request', 'Invalid file pattern')
@@ -876,20 +1129,14 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
         if destination[-1] == '/':
           destination = destination[:-1]
 
-        # Add Workflow ID and Stage ID to URL
-        destination = destination + '/%05d/%d' % (workflowID, stageID)
+        # Add Workflow ID and Stage ID and patternID to URL
+        destination = destination + \
+                      '/%s/%05d/%d' % (justin.instance, workflowID, stageID)
     else:
         if lifetimeDays == 0:
-          try:
-            didClient.get_metadata(scope = scopeName, name = destination)
-
-          except rucio.common.exception.DataIdentifierNotFound:
-            return ('400 Bad Request',
-                    'A lifetime must be specified when creating a stage if '
-                    'a Rucio dataset is given that does not yet exist.')
-          except:
-            return ('400 Bad Request', 
-                    'Failed to connect to Rucio server for dataset checks')
+          return ('400 Bad Request',
+                  'A lifetime must be specified when creating a stage if '
+                  'a Rucio dataset is used for any outputs.')
 
         # Rucio dataset name
         if not justin.stringIsDID(destination) or ':' in destination:
@@ -899,15 +1146,18 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
         justin.insertUpdate('INSERT INTO stages_outputs SET '
               'workflow_id=%d,'
               'stage_id=%d,'
+              'pattern_id=%d,'
               'destination="%s",'
               'file_pattern="%s",'
               'lifetime_seconds=%d,'
-              'for_next_stage=%s' % 
-              (workflowID, stageID,
+              'for_next_stage=%s,'
+              'rse_expression="%s"' % 
+              (workflowID, stageID, patternID,
                destination,
                pattern,
                lifetimeDays * 86400,
-               forNextStage
+               forNextStage,
+               outputExpression
               )
              )
 
@@ -915,22 +1165,101 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
         return ('500 Internal Server Error',
                 'Error adding stage output: ' + str(e))
 
+  # Store a lowercase version of the preferred output RSEs
+  preferredRseNames = []
   if jsonDict['output_rse']:
     for rseName in jsonDict['output_rse']:
-    
       if not justin.stringIsSite(rseName):
         return ('400 Bad Request', 'Invalid RSE name')
+      else:
+        preferredRseNames.append(rseName.lower())
 
-      try:        
-        justin.insertUpdate('INSERT INTO stages_output_storages SET '
+  # Get a list of all non-decommissioned RSEs
+  try:
+    rseRows = justin.select('SELECT rse_id,rse_name FROM storages '
+                            'WHERE NOT decommissioned AND rse_id<>%d'
+                            % justin.MonteCarloRseID)
+
+    justin.insertUpdate('INSERT INTO stages_input_storages SET '
               'workflow_id=%d,'
               'stage_id=%d,'
-              'rse_id=(SELECT rse_id FROM storages WHERE rse_name="%s")' % 
-              (workflowID, stageID, rseName))
+              'rse_id=%d ' %
+              (workflowID, stageID, justin.MonteCarloRseID))
+  except Exception as e:
+    return ('500 Internal Server Error',
+            'Error getting list of RSEs: ' + str(e))
 
-      except Exception as e:
-        return ('500 Internal Server Error', 
-                'Error adding output RSE: ' + str(e))
+  # We go through all found RSEs, adding them, marking the preferred ones
+  for rseRow in rseRows:
+    try:
+      justin.insertUpdate('INSERT INTO stages_input_storages SET '
+              'workflow_id=%d,'
+              'stage_id=%d,'
+              'rse_id=%d ' %
+              (workflowID, stageID, rseRow['rse_id']))
+
+      justin.insertUpdate('INSERT INTO stages_output_storages SET '
+              'workflow_id=%d,'
+              'stage_id=%d,'
+              'rse_id=%d,'
+              'preferred=%d' %
+              (workflowID, stageID, rseRow['rse_id'],
+               True if rseRow['rse_name'].lower() in preferredRseNames 
+               else False))
+
+    except Exception as e:
+      return ('500 Internal Server Error', 
+              'Error adding input/output RSE: ' + str(e))
+
+  if jsonDict['site']:
+    if not justin.stringIsSite(jsonDict['site']):
+      return ('400 Bad Request', 'Invalid site name')
+ 
+    # Get info on the requested site
+    try:
+      siteRow = justin.select('SELECT site_id,enabled,only_production '
+                              'FROM sites '
+                              'WHERE site_name="%s"' % jsonDict['site'],
+                              justOne = True)
+    except Exception as e:
+      return ('500 Internal Server Error',
+              'Error getting site info: ' + str(e))
+
+    if not siteRow['enabled']:
+      return ('404 Not Found', 'Site is not enabled')
+      
+    if siteRow['only_production'] and \
+       '/dune/production' not in user['wlcg_groups']:
+      return ('403 Forbidden', 'Site is only allowed for production group')
+
+    siteRows = [ { 'site_id' : siteRow['site_id'] } ]      
+  else:
+    # Get a list of all enabled sites
+    try:
+      query = ('SELECT site_id,site_name FROM sites '
+               'WHERE enabled AND NOT only_on_request')
+
+      if '/dune/production' not in user['wlcg_groups']:
+        query += ' AND NOT only_production'
+
+      siteRows = justin.select(query)
+
+    except Exception as e:
+      return ('500 Internal Server Error',
+              'Error getting list of sites: ' + str(e))
+
+  # We go through all currently enabled sites, adding them
+  for siteRow in siteRows:
+    try:
+      justin.insertUpdate('INSERT INTO stages_sites SET '
+              'workflow_id=%d,'
+              'stage_id=%d,'
+              'site_id=%d ' %
+              (workflowID, stageID, siteRow['site_id']))
+
+    except Exception as e:
+      return ('500 Internal Server Error', 
+              'Error adding site: ' + str(e))
 
   if jsonDict['env']:
     for envNameValue in jsonDict['env']:    
@@ -988,6 +1317,71 @@ def createStage(jsonDict, user, simple = False, scopeName = None):
         return ('500 Internal Server Error', 
                 'Error adding custom ClassAds: ' + str(e))
 
+  if jsonDict['git_repo']:
+    for gitRepo in jsonDict['git_repo']:
+      if not justin.stringIsURL(gitRepo):
+        return ('400 Bad Request', 'Invalid characters in GitHub repo')
+
+      try:
+        (gitPath, gitTag) = gitRepo.split(':', 1)
+      except:
+        return ('400 Bad Request', 
+                'GitHub repo must be of the form NAME/REPO:TAG')
+
+      gitPathList = gitPath.split('/')
+      if len(gitPathList) != 2 or \
+         not gitPathList[0] or \
+         not gitPathList[1] or \
+         gitPath.endswith('.git'):
+        return ('400 Bad Request', 
+                'GitHub repo must be of the form NAME/REPO:TAG with one slash '
+                'and no .git')
+
+      try:
+        tmpDir = tempfile.TemporaryDirectory()
+
+        outcome = subprocess.run('cd %s && '
+                        '/usr/bin/git clone --branch %s '
+                        '--single-branch https://github.com/%s/%s.git && '
+                        'cd %s && '
+                        '/usr/bin/git log --pretty=format:"%%H" -n 1 '
+                        '--output=../hash.txt'
+                        % (tmpDir.name, gitTag, gitPathList[0],
+                           gitPathList[1], gitPathList[1]),
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                        shell=True
+                                )
+    
+        if outcome.returncode:
+          print(outcome.stdout, file=sys.stderr)
+          raise RuntimeError('git clone returns error %d' 
+                             % outcome.returncode)
+
+        gitCommit = open(tmpDir.name + '/hash.txt', 'r').read().strip()
+      except Exception as e:
+        
+        return ('400 Bad Request',
+                'Unable to checkout tag %s from '
+                'https://github.com/%s/%s.git: %s'
+                % (gitTag, gitPathList[0], gitPathList[1], str(e))
+               )
+
+      try:
+        justin.insertUpdate('INSERT IGNORE INTO stages_git_repos SET '
+              'workflow_id=%d,'
+              'stage_id=%d,'
+              'git_repo="%s",'
+              'git_commit="%s"' %
+              (workflowID, 
+               stageID, 
+               gitRepo,
+               gitCommit
+              ))
+
+      except Exception as e:
+        return ('500 Internal Server Error', 
+                'Error adding Git repo: ' + str(e))
+
   return ('200 OK', '')
 
 def createStageCmd(startResponse, jsonDict, user):
@@ -998,131 +1392,6 @@ def createStageCmd(startResponse, jsonDict, user):
     return httpOK(startResponse, message)
 
   return httpError(startResponse, code, message)
-
-def createJobscriptCmd(startResponse, jsonDict, user):
-  # Add a named jobscript to the jobscripts library NOT to a stage
-
-  if 'jobscript' in jsonDict and jsonDict['jobscript']:
-    jobscript = jsonDict['jobscript'] + '\n'
-  else:
-    return httpError(startResponse, 
-                     '400 Bad Request', 
-                     'Uploaded jobscript is required')
-
-  if 'name' in jsonDict and jsonDict['name']:
-    name = jsonDict['name'].lower()
-  else:
-    return httpError(startResponse, 
-                     '400 Bad Request', 
-                     'You must give a name for the jobscript')
-
-  if not justin.stringIsDomain(name):
-    return httpError(startResponse,
-                     '400 Bad Request', 
-                     'Jobscript name can only be characters a-z 0-9 - _ .')
-
-  if 'description' in jsonDict and jsonDict['description']:
-    description = jsonDict['description']
-  else:
-    description = ''
-
-  if 'scope' in jsonDict and jsonDict['scope']:
-    # --scope option given, so find the scope
-    scopeName = jsonDict['scope'].lower()
-
-    if not justin.stringIsDomain(scopeName):
-      return httpError(startResponse,
-                       '400 Bad Request', 
-                       'Scope name can only be characters a-z 0-9 - _ .')
-
-    try:
-      scopeRow = justin.select('SELECT scope_id,wlcg_group_name '
-                           'FROM scopes '
-                           'LEFT JOIN wlcg_groups '
-                           'ON wlcg_groups.wlcg_group_id=scopes.wlcg_group_id '
-                           'WHERE scope_name="%s"' % scopeName,
-                           justOne=True)
-      scopeID       = int(scopeRow['scope_id'])
-      wlcgGroupName = scopeRow['wlcg_group_name']
-    except Exception as e:
-      print('Finding scope fails: ' + str(e), file=sys.stderr)
-      return httpError(startResponse,
-                       '400 Bad Request', 
-                       'Failed to find scope %s in justIN database' % scopeName) 
-
-    if not wlcgGroupName:
-      return httpError(startResponse,
-                       '403 Forbidden',
-                       'Scope %s has no group defined and cannot yet be '
-                       'used via justIN' % scopeName)
-
-    if wlcgGroupName not in user['wlcg_groups']:
-      return httpError(startResponse,
-                       '403 Forbidden', 
-                       'You need to be in group %s to use scope %s' 
-                       % (wlcgGroupName, scopeName))
-
-    jobscriptIdentifier = scopeName + ':' + name
-    jobscriptUserID = 0
-  else:
-    # No scope, so set user_id instead
-    scopeID = 0
-    jobscriptUserID = user['user_id']
-    jobscriptIdentifier = user['user_name'] + ':' + name
-
-  try:
-    # Check if jobscript with this user/scope and name exists already
-    row = justin.select('SELECT jobscript_id FROM jobscripts_library '
-                           'WHERE user_id=%d AND scope_id=%d AND '
-                           'jobscript_name="%s"'
-                           % (jobscriptUserID, scopeID, name), justOne = True)
-
-    jobscriptID = int(row['jobscript_id'])
-
-  except Exception as e:
-    print(str(e), file=sys.stderr)
-    # If not present, create one from scratch
-    try:
-      justin.insertUpdate('INSERT INTO jobscripts_library SET '
-                             'scope_id=%d,'
-                             'user_id=%d,'
-                             'author_id=%d,'
-                             'jobscript_name="%s",'
-                             'jobscript="%s",'
-                             'description="%s",'
-                             'created_time=NOW()'
-                       % (scopeID,
-                          jobscriptUserID,
-                          user['user_id'],
-                          name,
-                          jobscript.replace('\\','\\\\').replace('"','\\"'),
-                          description.replace('\\','\\\\').replace('"','\\"')
-                         ))
-
-    except Exception as e:
-      return httpError(startResponse, 
-                       '500 Internal Server Error', 
-                       'Error adding jobscript to library: ' + str(e))   
-  else:
-    # Already there, so update it with the new values
-    try:
-      justin.insertUpdate('UPDATE jobscripts_library SET '
-                             'jobscript="%s",'
-                             'author_id=%d,'
-                             'description="%s",'
-                             'created_time=NOW() '
-                             'WHERE jobscript_id=%d '
-                       % (jobscript.replace('\\','\\\\').replace('"','\\"'),
-                          user['user_id'],
-                          description.replace('\\','\\\\').replace('"','\\"'),
-                          jobscriptID))
-
-    except Exception as e:
-      return httpError(startResponse, 
-                       '500 Internal Server Error', 
-                       'Error updating jobscript in library: ' + str(e))
-
-  return httpOK(startResponse, jobscriptIdentifier + '\n')
 
 def failFilesCmd(startResponse, jsonDict, user):
 
@@ -1135,13 +1404,15 @@ def failFilesCmd(startResponse, jsonDict, user):
 
   try:
     row = justin.select('SELECT workflows.user_id,wlcg_group_name '
-                        'FROM workflows '
-                        'LEFT JOIN scopes '
-                        'ON scopes.scope_id=workflows.scope_id '
-                        'LEFT JOIN wlcg_groups '
-                        'ON wlcg_groups.wlcg_group_id=scopes.wlcg_group_id '
-                        'WHERE workflows.workflow_id=%d' % workflowID, 
-                        justOne = True)
+                   'FROM workflows '
+                   'LEFT JOIN scopes '
+                   'ON scopes.scope_id=workflows.scope_id '
+                   'LEFT JOIN named_quotas '
+                   'ON scopes.quota_id=named_quotas.quota_id '
+                   'LEFT JOIN wlcg_groups '
+                   'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                   'WHERE workflows.workflow_id=%d' % workflowID, 
+                   justOne = True)
 
     workflowUserID = row['user_id']
     wlcgGroupName = row['wlcg_group_name']
@@ -1151,6 +1422,7 @@ def failFilesCmd(startResponse, jsonDict, user):
                      'Database error')
   
   if workflowUserID != user['user_id'] and \
+     user['user_name'] not in justin.justinAdmins and \
      wlcgGroupName not in user['wlcg_groups']:
     return httpError(startResponse,
                      '403 Forbidden',
@@ -1229,6 +1501,138 @@ def showJobsCmd(startResponse, jsonDict):
    
   return httpOK(startResponse, outputString)
 
+def fetchLogsCmd(startResponse, jsonDict):
+
+  try:
+    jobsubID = jsonDict['jobsub_id']
+  except:
+    return httpError(startResponse, 
+                     '400 Bad Request', 'Jobsub ID must be given')
+
+  if not justin.stringIsJobsubID(jobsubID):
+    return httpError(startResponse, 
+                     '400 Bad Request', 'Not a valid jobsub ID')
+
+  try:
+    client         = rucio.client.Client(timeout = 60)
+    downloadClient = rucio.client.downloadclient.DownloadClient(client)
+  except Exception as e:
+    print('Failed to connect to Rucio: ' + str(e), file=sys.stderr)
+    return httpError(startResponse, '500 Internal Server Error', 
+                     'justIN server failed to connect to Rucio')
+    
+  try:
+    tmpDir = tempfile.TemporaryDirectory()
+    downloadClient.download_dids([
+         { 'did' : 'justin-logs:%s.logs.tgz' % jobsubID.replace('@','-'),
+           'transfer_timeout' : 60,
+           'base_dir'         : tmpDir.name,
+           'no_subdir'        : True } ])
+  except Exception as e:
+    return httpError(startResponse, 
+                     '500 Internal Server Error', 
+                     'Fetching logs.tgz fails with Rucio error: ' + str(e))
+
+  try:
+    message = open(tmpDir.name + 
+                   '/%s.logs.tgz' % jobsubID.replace('@','-'), 'rb').read()
+  except:
+    return httpError(startResponse, '500 Internal Server Error', 
+                     'justIN server failed to read spooled logs.tgz')
+
+  startResponse('200 OK',
+                [('Content-type',   'application/gzip'),
+                 ('Content-length', str(len(message)))
+                ])
+
+  return [message]
+
+def getTokenCmd(startResponse, jsonDict, user):
+
+# CHECK IF TOKEN HAS EXPIRED SOMEHOW ... HOW???? ... AND DO 'SOMETHING'
+  responseDict = { 'access_token'         : user['access_token'],
+                   'access_token_seconds' : user['access_token_seconds'] }
+
+  if 'production' in jsonDict and jsonDict['production'] and \
+     '/dune/production' in user['wlcg_groups']:
+    proxyString = justin.jobsProductionProxyString
+  else:
+    proxyString = justin.jobsNoRolesProxyString
+
+  if not proxyString:
+    print('Failed to read proxy file from disk?', file=sys.stderr)
+
+  proxyKey      = RSA.load_key_string(proxyString)
+  proxyCertsBIO = BIO.MemoryBuffer(proxyString)
+
+  proxyCerts = []
+  while True:
+    try:
+      proxyCerts.append(X509.load_cert_bio(proxyCertsBIO))
+    except:
+      proxyCertsBIO.close()
+      break
+
+  newPubKey = X509.load_request_string(jsonDict['proxy_csr'], 
+                                       X509.FORMAT_PEM).get_pubkey()
+
+  # Create and populate new certificate   
+  newCert = X509.X509()
+  newCert.set_pubkey(newPubKey)
+  newCert.set_serial_number(int(time.time() * 100))
+  newCert.set_issuer_name(proxyCerts[0].get_subject())
+  newCert.set_version(2) # "2" is X.509 for "v3" ...
+
+  # Add CN=CENTISECONDS to existing VOMS proxy DN
+  newSubject = proxyCerts[0].get_subject()
+#WANT USER ID IN CN TOO???
+  newSubject.add_entry_by_txt(field = "CN",
+                              type  = 0x1001,
+                              entry = str(int(time.time() * 100)),
+                              len   = -1,
+                              loc   = -1,
+                              set   = 0)
+
+  newCert.set_subject_name(newSubject)
+
+  # Set not before time to now
+  newNotBefore = ASN1.ASN1_UTCTIME()
+  newNotBefore.set_time(int(time.time()))
+  newCert.set_not_before(newNotBefore)
+
+  # Set not after time to now + 1 days
+  responseDict['proxy_seconds'] = 90000 # 25 hours
+  newNotAfter = ASN1.ASN1_UTCTIME()
+  newNotAfter.set_time(int(time.time()) + responseDict['proxy_seconds']) 
+  newCert.set_not_after(newNotAfter)
+
+  # Usual extension giving key usage
+  newCert.add_ext(X509.new_extension("keyUsage", 
+                  "Digital Signature, Key Encipherment, Key Agreement", 1))
+
+  # Special extension for RFC X.509 proxies 
+  newCert.add_ext(X509.new_extension("proxyCertInfo", 
+                  "critical, language:1.3.6.1.4.1.3536.1.1.1.9", 1, 0))
+
+  # Sign this new cert with the VOMS proxy private key
+  proxyKeyEVP = EVP.PKey()
+  proxyKeyEVP.assign_rsa(proxyKey)
+  newCert.sign(proxyKeyEVP, 'sha256')
+
+  # Return the results as PEM encoded strings
+  proxyCertsChain = ''
+  for oneCert in proxyCerts:
+     proxyCertsChain += oneCert.as_pem().decode()
+
+  responseDict['proxy_cert']  = newCert.as_pem().decode()
+  responseDict['proxy_chain'] = proxyCertsChain
+
+  output = json.dumps(responseDict)
+  startResponse('200 OK',
+                [('Content-type',  'application/json'),
+                 ('Content-length', str(len(output)))
+                ])
+  return [output.encode('UTF-8')]
 #
 # Start of utility functions
 #
@@ -1247,7 +1651,9 @@ def getUser(jsonDict):
   try:
     row = justin.select(
            'SELECT principal_name,sessions.user_id,'
-           'sessions.wlcg_groups,expires_time '
+           'sessions.wlcg_groups,expires_time,access_token,'
+           'UNIX_TIMESTAMP(access_token_expires)-UNIX_TIMESTAMP() '
+           'AS access_token_seconds '
            'FROM sessions '
            'LEFT JOIN users ON users.user_id=sessions.user_id '
            'LEFT JOIN principal_names '
@@ -1257,18 +1663,23 @@ def getUser(jsonDict):
            'AND session_type="command"' % (session, secret),
            justOne = True)
   
-    userID         = int(row['user_id'])
-    userName       = row['principal_name']
-    wlcgGroups     = row['wlcg_groups'].split()
-    expiresTime    = row['expires_time']
+    userID             = int(row['user_id'])
+    userName           = row['principal_name']
+    wlcgGroups         = row['wlcg_groups'].split()
+    expiresTime        = row['expires_time']
+    accessToken        = row['access_token']
+    accessTokenSeconds = int(row['access_token_seconds'])
   except Exception as e:
     print('Finding session fails with: ' + str(e), file=sys.stderr)
     return None
 
-  return { 'user_id'         : userID,
-           'user_name'       : userName,
-           'expires_time'    : expiresTime,
-           'wlcg_groups'     : wlcgGroups }
+  return { 'user_id'              : userID,
+           'user_name'            : userName,
+           'expires_time'         : expiresTime,
+           'wlcg_groups'          : wlcgGroups,
+           'access_token'         : accessToken,
+           'access_token_seconds' : accessTokenSeconds
+         }
 
 def newSession(startResponse, environ, jsonDict):
   
@@ -1316,13 +1727,13 @@ def newSession(startResponse, environ, jsonDict):
 '''
 To authorize this computer to run the justin command, visit this page with your
 usual web browser and follow the instructions within the next 10 minutes:
-https://justin%s.dune.hep.ac.uk/authorize/%s
+%s/authorize/%s
 
 Check that the Session ID displayed on that page is %s
 
-Once you've followed the instructions on that web page, you can run the justin
-command without needing to authorize this computer again for 7 days.
-''' % ('' if (justin.proDev == 'pro') else ('-' + justin.proDev),
+Once you've followed the instructions on that web page, please run the command
+you tried again. You won't need to authorize this computer again for 7 days.
+''' % (justin.dashboardURL,
        justinCode, justinSession[:7])
    
   return httpError(startResponse, 
@@ -1332,9 +1743,11 @@ command without needing to authorize this computer again for 7 days.
 def scopesInfo(startResponse):
 
   rows = justin.select('SELECT scope_name,wlcg_group_name FROM scopes '
-                       'LEFT JOIN wlcg_groups '
-                       'ON scopes.wlcg_group_id=wlcg_groups.wlcg_group_id '
-                       'ORDER BY scope_name')
+                   'LEFT JOIN named_quotas '
+                   'ON named_quotas.quota_id=scopes.quota_id '
+                   'LEFT JOIN wlcg_groups '
+                   'ON named_quotas.wlcg_group_id=wlcg_groups.wlcg_group_id '
+                   'ORDER BY scope_name')
   output = ''
   for row in rows:
     
@@ -1400,6 +1813,56 @@ def sitesStoragesInfo(startResponse):
                 ])
   return [output.encode('UTF-8')]
 
+# stages_git_repos SET '
+#                        'rcds_hash="%s",rcds_path
+
+def listGitReposToDo(startResponse):
+  # List the Git repos which are still to put in RCDS, from workflows
+  # still in the submitted state. This is accessed by the FNAL agent
+  # to get its list of repos to work through.
+
+  try:
+    rows = justin.select('SELECT stages_git_repos.workflow_id,'
+                    'stages_git_repos.stage_id,git_repo,git_commit '
+                    'FROM stages_git_repos '
+                    'LEFT JOIN workflows '
+                    'ON workflows.workflow_id=stages_git_repos.workflow_id '
+                    'WHERE workflows.state="submitted" AND rcds_path="" '
+                    'ORDER BY workflow_id,stage_id')
+  except Exception as e:
+    output = 'SELECT failed: ' + str(e)
+    startResponse('500 Internal Server Error',
+                [('Content-type',  'text/plain'),
+                 ('Content-length', str(len(output)))
+                ])
+    return [output.encode('UTF-8')]
+
+  outputList = []
+  for row in rows:
+    outputList.append({ 'workflow_id' : row['workflow_id'],
+                        'stage_id'    : row['stage_id'],
+                        'git_repo'    : row['git_repo'],
+                        'git_commit'  : row['git_commit']
+                      })
+
+  output = json.dumps(outputList)
+  startResponse('200 OK',
+                [('Content-type',  'application/json'),
+                 ('Content-length', str(len(output)))
+                ])
+  return [output.encode('UTF-8')]
+
+def updateGitRepo(startResponse, jsonDict):
+  # Update one Git repo in the database after it has been processd by
+  # the FNAL agent
+
+  output = json.dumps({})
+  startResponse('200 OK',
+                [('Content-type',  'application/json'),
+                 ('Content-length', str(len(output)))
+                ])
+  return [output.encode('UTF-8')]
+
 #
 # Entry point from mod_wsgi
 #
@@ -1408,6 +1871,8 @@ def application(environ, startResponse):
   justin.wsgiCallsCount += 1
   print('Call count (pid=%d): %d' % (os.getpid(), justin.wsgiCallsCount), 
         file=sys.stderr)
+
+  justin.readConf()
 
   try:
     # True should provoke a reconnection attempt.
@@ -1423,6 +1888,8 @@ def application(environ, startResponse):
   # and make sure autocommit is not set
   justin.conn.rollback()
   justin.conn.autocommit(False)
+ 
+  justin.checkProxyStrings()
 
   if environ['REQUEST_URI'] == '/api/info/scopes.csv':
     return scopesInfo(startResponse)
@@ -1435,6 +1902,9 @@ def application(environ, startResponse):
 
   if environ['REQUEST_URI'] == '/api/info/sites_storages.csv':
     return sitesStoragesInfo(startResponse)
+
+  if environ['REQUEST_URI'] == '/api/fnal/git-repos-to-do':
+    return listGitReposToDo(startResponse)
 
   # Quickly reject random GETs etc (if not handled by Apache already)
   if environ['REQUEST_METHOD'] != 'POST':
@@ -1451,6 +1921,9 @@ def application(environ, startResponse):
     return httpError(startResponse, 
                      '400 Bad Request', 
                      'Failed to read and parse JSON')
+
+  if environ['REQUEST_URI'] == '/api/fnal/git-repo-update':
+    return updateGitRepo(startResponse, jsonDict)
 
   # This returns an error if an authorized DN is not found
   user = getUser(jsonDict)
@@ -1492,6 +1965,9 @@ def application(environ, startResponse):
   if jsonDict['command'] == 'show-replicas':
     return showReplicasCmd(startResponse, jsonDict)
 
+  if jsonDict['command'] == 'create-campaign':
+    return createCampaignCmd(startResponse, jsonDict, user)
+
   if jsonDict['command'] == 'create-workflow':
     return createWorkflowCmd(startResponse, jsonDict, user)
 
@@ -1505,11 +1981,14 @@ def application(environ, startResponse):
   if jsonDict['command'] == 'create-stage':
     return createStageCmd(startResponse, jsonDict, user)
 
-  if jsonDict['command'] == 'create-jobscript':
-    return createJobscriptCmd(startResponse, jsonDict, user)
-
   if jsonDict['command'] == 'show-jobs':
     return showJobsCmd(startResponse, jsonDict)
+
+  if jsonDict['command'] == 'fetch-logs':
+    return fetchLogsCmd(startResponse, jsonDict)
+
+  if jsonDict['command'] == 'get-token':
+    return getTokenCmd(startResponse, jsonDict, user)
 
   return httpError(startResponse,
                    '400 Bad Request', 

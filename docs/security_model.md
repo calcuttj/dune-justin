@@ -1,8 +1,5 @@
 # justIN security model
 
-**This model will be fully deployed once the transition to the DUNE global
-pool and the dedicated justIN schedd is complete.**
-
 justIN has three largely independent security systems: how users are
 authenticated and receive DUNE group memberships; how justIN decides what it
 will do on behalf of a particular user; and how credentials are supplied to
@@ -29,7 +26,12 @@ The access token and refresh token are saved in the justIN database, and the
 OIDC calls to CILogon so it is immediately available to the 
 [justIN allocator](services.allocator.md) without any latency.
 Refreshing continues as long as the user has an unexpired web or
-command line session.
+command line session. 
+
+Users may view their current access token after
+logging in by clicking on the orange button with their username at the top 
+right of any page and looking at the Your Access Token table. This also
+shows the OAuth scopes requested from CILogon.
 
 ## DUNE groups and Rucio scopes
 
@@ -38,20 +40,15 @@ member of additional groups. These are updated from CILogon each time the
 user logs in. 
 
 justIN also obtains a list of the current scopes known to Rucio and 
-assigns some of them to a group. In general, seveal scopes are assigned to
+assigns some of them to a group. In general, several scopes are assigned to
 each group. Every member of the group for a particular scope is entitled to 
 create files and datasets within that scope. justIN checks user group 
 membership when a user asks justIN to create files within a scope. This only
 covers writing and file creation: every DUNE member is able to read DUNE
 files.
 
-The scopes are also used to control write access to jobscripts in the 
-[Jobscripts Library](jobscripts_library.md) and the ability to modify 
-workflows to process files. Each 
-jobscript in the library must be associated with a scope and each workflow
-may be assigned to a scope and that must be the case if the workflow needs
-to create files within a scope. This allows working group production teams,
-for example, to collaborate on jobscripts and on managing running workflows.
+The scopes are also used to control write the 
+ability to modify workflows to process files. 
 
 ## Credentials in justIN jobs
 
@@ -63,10 +60,11 @@ each job in the cluster. The wrapper jobs use the secrets to authenticate
 to the justIN allocator service, in the form of HMAC SHA256 hashes of the
 method, time and job ID to prevent replay attacks and reuse of unused hashes.
 
-When the wrapper job starts it sends a `get_stage` workflow to the allocator 
-to discover what stage within what workflow to work on. As part of this
-message, the job includes an X.509 certificate signing workflow which matches
-an RSA key it has created. The allocator signs the workflow with a VOMS proxy
+When the wrapper job starts it sends a `get_jobscript` request to the allocator 
+to get the jobscript and job parameters for its stage within its workflow 
+that it will work on. As part of this
+message, the job includes an X.509 certificate signing request which matches
+an RSA key it has created. The allocator signs the request with a VOMS proxy
 it has and returns the certificates chain to the job, which is then able to 
 assemble a valid VOMS proxy includng the private key it created earlier.
 
@@ -77,7 +75,7 @@ which allows the wrapper job to register output files in MetaCat and Rucio
 and to upload files on behalf of the user after the
 jobscript has finished.
 
-The allocation of a stage to a job also provides another secret: the
+This response also provides another secret: the
 jobscript secret. This is only used within the inner Apptainer container 
 that runs the user's jobscript, to ask the justIN allocator to allocate files 
 to the job. This secret is specific to that job and cannot be used

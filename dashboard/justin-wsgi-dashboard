@@ -1,7 +1,7 @@
 #
 # justin-wsgi-dashboard - justIN workflow system dashboard
 #
-# Copyright 2013-24, Andrew McNab for the University of Manchester
+# Copyright 2013-25, Andrew McNab for the University of Manchester
 # 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@ import json
 import secrets
 import base64
 import pprint
+import textwrap
 import urllib
 import urllib.parse
 import urllib.request
@@ -38,6 +39,8 @@ import pygal
 
 # needs python36-markdown RPM
 import markdown
+
+import metacat.webapi
 
 import justin
 
@@ -95,6 +98,14 @@ class justinStackedLine(pygal.StackedLine):
                 else:
                     serie.interpolated = []
 
+def insertWBR(s):
+  a = textwrap.wrap(text=s, width=20, drop_whitespace=False)
+
+  for i in range(0, len(a)):
+    a[i] = a[i].replace('<', '&lt;').replace('>', '&gt')
+
+  return '<wbr>'.join(a)
+
 def header(environ, user, title):
 
   if user is None:
@@ -114,6 +125,12 @@ def header(environ, user, title):
                 '%s</a>'
                 % (user['user_name'], user['user_name']))
 
+  if justin.bannerMessage:
+    bannerMessageStr = '\n<p style="text-align: center">%s</p>\n' \
+                       % justin.bannerMessage
+  else:
+    bannerMessageStr = ''
+
   return ("""<html><head><title>%s</title>
 <link rel="icon" href="/favicon.png">
 <style>
@@ -129,6 +146,8 @@ a {
   color: #337AB7;
   text-decoration: none;
 }
+
+label { white-space: nowrap; }
 
 #top_strip,#bottomstrip { 
   color: #FFFFFF;
@@ -198,9 +217,30 @@ td,th { border: thin solid #87ADD1; padding: 0.75ex }
                          text-decoration: none;  
                        }
 
+input[type=button], input[type=submit], input[type=reset] {
+  background-color: #E1703D;
+  border-style: none;
+  border-radius: 5px; 
+  padding: 5px;
+  color: white;
+  font-weight: bold;
+}
+
+a.button {
+  background-color: #E1703D;
+  border-style: none;
+  border-radius: 5px; 
+  border: 1px outset buttonborder;
+  padding: 5px;
+  color: white;
+  font-weight: bold;
+  font-size: 11px;
+}
+
 </style>
 <script type="text/javascript" 
- src="https://kozea.github.io/pygal.js/2.0.x/pygal-tooltips.min.js"></script>
+ Xsrc="https://kozea.github.io/pygal.js/2.0.x/pygal-tooltips.min.js" 
+ src="/pygal-tooltips.min.js"></script>
 </head>
 <body>
 <div id="top_strip">
@@ -214,11 +254,11 @@ td,th { border: thin solid #87ADD1; padding: 0.75ex }
 <a href="/dashboard/?method=list-storages">Storages</a> &nbsp; &nbsp; &nbsp;
 <a href="/docs/">Docs</a>%s
 </div>
-<div id="main_box">
+<div id="main_box">%s
 """ % (title, 
        (environ['SERVER_NAME'].upper().split('.')[0]).split('-',1)[1] if '-' in environ['SERVER_NAME']
           else 'justIN',
-       loginStr))
+       loginStr, bannerMessageStr))
 
 def footer():
   return ('</div>'
@@ -241,7 +281,9 @@ def startResponseOK(startResponse, output, contentType = 'text/html',
                  ('Content-Disposition', contentDisposition)
                 ])
 
-
+def startResponseRedirect(startResponse, url):
+  # HTTP redirect
+  startResponse('302 Found', [('Location', url)] )
 
 def spaceForUnixEpoch(s):
   if str(s) == justin.unixEpoch:
@@ -273,11 +315,17 @@ def makePager(pageNumber, pageLength, rowsLen, urlTemplate):
   if rowsLen > pageLength:
     output += ((' <a href="' + urlTemplate + '">Next</a> ') % 
                (pageNumber + 1, pageLength))
+
+#  output += '\n<!-- ' + urlTemplate + '-->\n'
                
   return output
 
 def buttonHTML(user = None, key = None, name = None, value = None, 
                label = None, nextURI = ''):
+
+  # key is some meaningful context for justIN, like a workflowID
+  # name is the name of the action, like 'workflow_finish'
+  # value is the value to set something to in that context, like 'finished'
 
   return ( '<form style="display:inline">'
            '<input type="submit" value="%s" formmethod="post" '
@@ -291,6 +339,110 @@ def buttonHTML(user = None, key = None, name = None, value = None,
            % (label, nextURI, user['justin_code'], 
               str(key), name, str(value)) 
          )
+
+def inputHTML(cgiValues, user, key = None, name = None, value = None,
+              size = 6, nextURI = ''):
+
+  # key is some meaningful context for justIN, like a workflowID
+  # name is the name of the action, like 'workflow_finish'
+  # value is the value to set something to in that context, like 'finished'
+
+  if 'input_key' in cgiValues and 'input_name' in cgiValues and \
+     cgiValues['input_key']  == key and \
+     cgiValues['input_name'] == name:
+    # This does the real input field box
+    return ( '<form style="display:inline">'
+             '<input type="hidden" name="next_uri" value="%s">'
+             '<input type="hidden" name="justin_code" value="%s">'
+             '<input type="hidden" name="action_key" value="%s">'
+             '<input type="hidden" name="action_name" value="%s">'
+             '<input type="text" name="action_value" value="%s" size="%d"> '
+             '<input type="submit" value="Save" formmethod="post" '
+             'formaction="/dashboard/">'
+             '</form>'
+             % (nextURI, user['justin_code'], 
+                str(key), name, 
+                html.escape(str(value), quote=True),
+                size) 
+         )
+
+  # This does the version with the value as text and then the Edit button
+  return ( '%s <a href="%s&input_key=%s&input_name=%s" class="button">'
+           'Edit</a>' % (html.escape(str(value), quote=True), 
+                         nextURI, str(key), name)
+         )
+
+def selectHTML(cgiValues, user, key = None, name = None, value = None,
+               options = None, nextURI = '', valueURL = None):
+
+  # key is some meaningful context for justIN, like a workflowID
+  # name is the name of the action, like 'workflow_finish'
+  # value is the value to set something to in that context, like 'finished'
+  # options is a list of pairs (optionValue,optionText)
+
+  if 'input_key' in cgiValues and 'input_name' in cgiValues and \
+     cgiValues['input_key']  == key and \
+     cgiValues['input_name'] == name:
+    # This does the real input field box
+    s = ( '<form style="display:inline">' 
+          '<input type="hidden" name="next_uri" value="%s">'
+          '<input type="hidden" name="justin_code" value="%s">'
+          '<input type="hidden" name="action_key" value="%s">'
+          '<input type="hidden" name="action_name" value="%s">'
+          '<select name="action_value">'
+          % (nextURI, user['justin_code'], str(key), name) )
+
+    for optionValue,optionText in options:
+      s += '<option value="%s" %s>%s</option>' % \
+           (optionValue, ('selected' if optionValue == value else ''), 
+            html.escape(optionText, quote=True))
+    
+    s += ( '</select> '
+           '<input type="submit" value="Save" formmethod="post" '
+           'formaction="/dashboard/">'
+           '</form>' )
+    
+    return s
+
+  # This does the version with the value as text and then the Edit button
+  if valueURL:
+    return ( '<a href="%s">%s</a> ' 
+             '<a href="%s&input_key=%s&input_name=%s" class="button">'
+             'Edit</a>' % (valueURL, str(value), nextURI, str(key), name) )
+
+  else:
+    return ( '%s <a href="%s&input_key=%s&input_name=%s" class="button">'
+             'Edit</a>' % (str(value), nextURI, str(key), name) )
+
+def wlcgGroupsDict():
+
+  try:
+    rows = justin.select('SELECT wlcg_group_name,wlcg_group_id '
+                         'FROM wlcg_groups '
+                         'ORDER BY wlcg_group_name')
+  except:
+    return {}
+
+  allGroups = {}
+  for row in rows:
+    allGroups[row['wlcg_group_name']] = row['wlcg_group_id']
+
+  return allGroups
+
+def condorGroupsDict():
+
+  try:
+    rows = justin.select('SELECT condor_group_name,condor_group_id '
+                         'FROM condor_groups '
+                         'ORDER BY condor_group_name')
+  except:
+    return {}
+
+  allGroups = {}
+  for row in rows:
+    allGroups[row['condor_group_name']] = row['condor_group_id']
+
+  return allGroups
 
 def mainPage(environ, user):
 
@@ -309,7 +461,10 @@ def mainPage(environ, user):
            'SELECT COUNT(*) FROM files '
            'LEFT JOIN workflows ON files.workflow_id=workflows.workflow_id '
            'WHERE files.state="unallocated" AND workflows.state="running" '
-           'AND workflows.workflow_id<>%d) AS unallocated_files' 
+           'AND workflows.workflow_id<>%d) AS unallocated_files,'
+           '(SELECT key_value FROM keys_names_values '
+           ' WHERE key_name="ping_rucio_milliseconds") '
+           ' AS ping_rucio_milliseconds'  
            % (justin.awtWorkflowID, justin.awtWorkflowID))
   try:
     row = justin.select(query, justOne = True)
@@ -318,13 +473,16 @@ def mainPage(environ, user):
   else:
     output += \
      ('<p style="text-align: center">%d running job%s in %d running '
-      'workflow%s. %d file%s not yet allocated to jobs.</p>\n' 
+      'workflow%s. %d file%s not yet allocated to jobs. '
+      'Rucio ping %.3fs.</p>\n' 
       % (row['running_jobs'], 
           '' if row['running_jobs'] == 1 else 's',
          row['running_workflows'], 
           '' if row['running_workflows'] == 1 else 's',
          row['unallocated_files'],
-          '' if row['unallocated_files'] == 1 else 's'))
+          '' if row['unallocated_files'] == 1 else 's',
+
+         int(row['ping_rucio_milliseconds']) / 1000.0))
 
   cells = [
    { 'startRow'  : True,
@@ -344,9 +502,13 @@ def mainPage(environ, user):
      'uri'       : '/dashboard/?method=awt-results',
      'text'      : 'Automated Workflow Tests' },
    { 'startRow'  : True,
-     'endRow'    : True,
+     'endRow'    : False,
      'uri'       : '/dashboard/?method=list-scopes',
      'text'      : 'Scopes' },
+   { 'startRow'  : False,
+     'endRow'    : True,
+     'uri'       : '/dashboard/?method=list-campaigns',
+     'text'      : 'Campaigns' },
    { 'startRow'  : True,
      'endRow'    : False,
      'uri'       : '/dashboard/?method=list-sites',
@@ -357,8 +519,8 @@ def mainPage(environ, user):
      'text'      : 'Storages' },
    { 'startRow'  : True,
      'endRow'    : False,
-     'uri'       : '/dashboard/?method=list-jobscripts',
-     'text'      : 'Jobscripts' },
+     'uri'       : '/dashboard/?method=list-quotas',
+     'text'      : 'Quotas' },
    { 'startRow'  : False,
      'endRow'    : True,
      'uri'       : '/docs/',
@@ -506,7 +668,8 @@ def cilogonCallback(startResponse, environ):
   # associate the session with the corresponding user (and create if needed)
 
   try:
-    row = justin.select('SELECT user_id FROM principal_names '
+    row = justin.select('SELECT user_id '
+                        'FROM principal_names '
                         'WHERE principal_name="%s"' % eppn, justOne = True)
     userID = int(row['user_id'])
   except:
@@ -540,15 +703,43 @@ def cilogonCallback(startResponse, environ):
     output = errorPage(environ, 'Failed to store your tokens')
     startResponseOK(startResponse, output)
     return output
-        
+
+  namedQuotas      = []
+  wlcgGroupsQuotes = []
+  for i in wlcgGroups:
+    wlcgGroupsQuotes.append('"' + i + '"')
+
+  try:
+    rows = justin.select('SELECT DISTINCT quota_name '
+                    'FROM named_quotas '
+                    'LEFT JOIN wlcg_groups '
+                    'ON named_quotas.wlcg_group_id=wlcg_groups.wlcg_group_id '
+                    'WHERE wlcg_groups.wlcg_group_name IN (%s) '
+                    'OR named_quotas.user_id=%d' %
+                    (','.join(wlcgGroupsQuotes), userID))
+ 
+    for row in rows:
+      if row['quota_name']:
+        namedQuotas.append(row['quota_name'])
+
+  except Exception as e:
+    print('Failed to get named quotas: ' + str(e), file=sys.stderr)
+    output = errorPage(environ, 'Failed to get named quotas')
+    startResponseOK(startResponse, output)
+    return output
+
   if authorizeSessionID:
      # If authorizing a computer, we create an extra session for that
      try:
         query = ('UPDATE sessions SET user_id=%d,wlcg_groups="%s",'
+                 'named_quotas="%s",'
                  'expires_time=DATE_ADD(NOW(),INTERVAL 7 DAY) '
                  'WHERE session_id = %d AND NOW() < expires_time AND '
                  'user_id = 0 AND session_type = "command"'
-                 % (userID, ' '.join(wlcgGroups), authorizeSessionID))
+                 % (userID, 
+                    ' '.join(wlcgGroups), 
+                    ' '.join(namedQuotas), 
+                    authorizeSessionID))
         
         justin.insertUpdate(query)
      except Exception as e:
@@ -558,13 +749,17 @@ def cilogonCallback(startResponse, environ):
 
   # We always create a web session, since we are here anyway
   try:
-      query = ('UPDATE sessions SET user_id=%d,wlcg_groups="%s" '
+      query = ('UPDATE sessions SET user_id=%d,wlcg_groups="%s",'
+               'named_quotas="%s" '
                'WHERE justin_session="%s" AND justin_secret="%s" AND '
                'user_id=0 AND session_type="web"'
-               % (userID, ' '.join(wlcgGroups), justinSession, justinSecret))
+               % (userID, 
+                  ' '.join(wlcgGroups),
+                  ' '.join(namedQuotas),
+                  justinSession, justinSecret))
       justin.insertUpdate(query)
   except Exception as e:
-      print('UPDATE sessions fails: ' + str(e), file=sys.stderr)
+      print('UPDATE web sessions fails: ' + str(e), file=sys.stderr)
   else:
       # This is where the created user gets committed too
       justin.conn.commit()
@@ -693,11 +888,11 @@ your user name.
   output += '''
 <input type="hidden" name="redirect_uri" 
  value="https://%s/login/cilogon/login">
-<input type="hidden" name="scope" 
- value="openid profile org.cilogon.userinfo wlcg.capabilityset:/duneana wlcg.groups:/dune wlcg.groups:/dune/production">
+<input type="hidden" name="scope" value="%s">
 <button type="submit" 
  style="background: #E1703D; border-radius: 5px; padding: 5px; color: white; font-weight: bold; font-size: 1em; border: 0; cursor: pointer">%s</button>
-</form></p>''' % (environ['SERVER_NAME'], 'Authorize' if authorize else 'Login')
+</form></p>''' % (environ['SERVER_NAME'], justin.cilogonScopes,
+                  'Authorize' if authorize else 'Login')
 
   output += '</td>'
 
@@ -746,7 +941,8 @@ def getUser(environ):
     return None
 
   try:
-    query = ('SELECT principal_name,sessions.user_id,justin_code,wlcg_groups '
+    query = ('SELECT principal_name,sessions.user_id,justin_code,wlcg_groups,'
+             'named_quotas '
              'FROM sessions '
              'LEFT JOIN users '
              'ON users.user_id=sessions.user_id '
@@ -756,11 +952,12 @@ def getUser(environ):
              'NOW() < expires_time AND sessions.user_id > 0'
              % (justinSession, justinSecret))
 
-    row        = justin.select(query, justOne = True)    
-    userName   = row['principal_name']
-    userID     = row['user_id']
-    justinCode = row['justin_code']
-    wlcgGroups = row['wlcg_groups'].split()
+    row         = justin.select(query, justOne = True)    
+    userName    = row['principal_name']
+    userID      = row['user_id']
+    justinCode  = row['justin_code']
+    wlcgGroups  = row['wlcg_groups'].split()
+    namedQuotas = row['named_quotas'].split()
     print(userName,userID,file=sys.stderr)
   except:
     return None
@@ -769,7 +966,8 @@ def getUser(environ):
            'user_id'        : userID,
            'justin_session' : justinSession,
            'justin_code'    : justinCode,
-           'wlcg_groups'    : wlcgGroups  }
+           'wlcg_groups'    : wlcgGroups,
+           'named_quotas'   : namedQuotas }
 
 def createUser(principalName):
   
@@ -824,127 +1022,573 @@ to visit.</p>
   
   return output
 
-def listJobscripts(environ, user, cgiValues, pageNumber, pageLength):
+def listCampaigns(environ, user, cgiValues, pageNumber, pageLength):
 
-  output = header(environ, user, "justIN: Jobscripts Library")
+  whereList = []
+  queryList = ''
 
-  output += "<h1>Jobscripts Library</h1>"
+  try:
+    userName = cgiValues["user_name"]
 
-  if user and user['user_name']:
-    output += ('<p><i>Public jobscripts with scopes and your own jobscripts '
-               'with prefix %s</i></p>\n' % user['user_name'])
+    if userName != '--ANY--' and not justin.stringIsUsername(userName):
+      raise
+  except:
+    userName = ''
 
-    query = ('SELECT scope_name,jobscripts_library.description,'
-             'authors_principals.principal_name AS author_name,'
-             'users_principals.principal_name AS jobscript_user_name,'
-             'created_time,jobscript_name '
-             'FROM jobscripts_library '
-             'LEFT JOIN users AS authors '
-             'ON jobscripts_library.author_id=authors.user_id '
-             'LEFT JOIN principal_names AS authors_principals '
-             'ON authors_principals.pn_id=authors.main_pn_id '
-             'LEFT JOIN users AS jobscripts_users '
-             'ON jobscripts_library.user_id=jobscripts_users.user_id '
-             'LEFT JOIN principal_names AS users_principals '
-             'ON users_principals.pn_id=jobscripts_users.main_pn_id '
-             'LEFT JOIN scopes ON jobscripts_library.scope_id=scopes.scope_id '
-             'WHERE jobscripts_library.user_id=0 '
-             'OR users_principals.principal_name="%s" '
-             'ORDER BY created_time DESC LIMIT %d,%d' %
-             (user['user_name'], pageNumber * pageLength, pageLength + 1))
-
+  if userName:
+    # If the user name was given explicitly, then we pass it on
+    # Otherwise it is left out for subsequent next page etc clicks
+    queryList += '&user_name=%s' % userName
   else:
-    query = ('SELECT scope_name,jobscripts_library.description,'
-             'authors_principals.principal_name AS author_name,'
-             'created_time,jobscript_name '
-             'FROM jobscripts_library '
-             'LEFT JOIN users AS authors '
-             'ON jobscripts_library.author_id=authors.user_id '
-             'LEFT JOIN principal_names AS authors_principals '
-             'ON authors_principals.pn_id=authors.main_pn_id '
-             'LEFT JOIN scopes ON jobscripts_library.scope_id=scopes.scope_id '
-             'WHERE jobscripts_library.user_id=0 '
-             'ORDER BY created_time DESC LIMIT %d,%d' %
-             (pageNumber * pageLength, pageLength + 1))
- 
-  rows = justin.select(query)
+    # But userName must be set to something, even just --ANY--
+    if user:
+      # User is logged in, so we use their name instead of implicit --ANY--
+      userName = user['user_name']
+    else:
+      # Always fall back to any user
+      userName = '--ANY--'
+
+  if userName != '--ANY--':
+    # For any user, we just skip this condition 
+    whereList.append('principal_name="%s"' % userName)
+
+  try:
+    quotaName = cgiValues["quota_name"]
+
+    if not justin.stringIsScope(quotaName):
+      raise
+  except:
+    quotaName = ''
+  else:
+    if quotaName:
+      whereList.append('quota_name="%s"' % quotaName)
+      queryList += '&quota_name=%s' % quotaName
+
+  if whereList:
+    whereString = ' WHERE ' + ' AND '.join(whereList)
+  else:
+    whereString = ''
+
+  # These lists are used for the pull down menus in the filter HTML
+  userRows = justin.select('SELECT principal_name FROM users '
+                           'LEFT JOIN principal_names '
+                           'ON users.main_pn_id=principal_names.pn_id '
+                           'ORDER BY principal_name')
+  quotaRows = justin.select('SELECT quota_name FROM named_quotas '
+                            'WHERE for_justin ORDER BY quota_name')
+
+  output = header(environ, user, "justIN: Campaigns")
+
+  output += "<h1>Campaigns</h1>"
+
+  output += ('<p><form method="get" formaction="/dashboard/">'
+    '<input type="hidden" name="method" value="list-campaigns">'
+    '<label>Created&nbsp;by:<select name="user_name">'
+    '<option value="--ANY--"%s>ANY</option>'
+    % (' selected' if userName == '--ANY--' else ''))
+
+  if user:
+    # If logged in, offer their own name first
+    output += ('<option value="%s"%s>%s</option>' 
+               % (user['user_name'],
+                  ' selected' 
+                  if user['user_name'] == userName
+                  else '',
+                  user['user_name']))
+
+  output += '<option value="" disabled>---</option>'
+
+  for userRow in userRows:
+    # List the other user names, selecting them if selected BUT not if
+    # its the logged in user since that is at the top of the list already
+    output += ('<option value="%s"%s>%s</option>' 
+               % (userRow['principal_name'],
+                  ' selected' 
+                  if userRow['principal_name'] == userName and 
+                  (not user or user['user_name'] != userRow['principal_name'])
+                  else '',
+                  userRow['principal_name']))
+
+  output += ('</select></label> '
+    '<label>Quota:<select name="quota_name">'
+    '<option value=""%s>ANY</option>'
+    % ('' if quotaName else ' selected'))
+  
+  for quotaRow in quotaRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (quotaRow['quota_name'],
+                  ' selected' 
+                  if quotaRow['quota_name'] == quotaName
+                  else '',
+                  quotaRow['quota_name']))
+
+  output += '</select></label> '
+
+  output += ('<input type="submit" value="Filter" '
+    'style="background: #E1703D; border-radius: 5px; padding: 5px; '
+    'color: white; font-weight: bold; font-size: 1em; border: 0; '
+    'cursor: pointer"></form></p>\n')
+  
+  query = ('SELECT campaign_id,campaigns.description,'
+           'principal_name AS user_name,'
+           'campaigns.created,quota_name,'
+           '(SELECT COUNT(*) FROM files'
+           ' LEFT JOIN workflows ON files.workflow_id=workflows.workflow_id '
+           ' WHERE workflows.campaign_id=campaigns.campaign_id'
+           ' AND files.stage_id=1 '
+           ' AND files.state="processed") AS files_processed,'
+           '(SELECT COUNT(*) FROM files'
+           ' LEFT JOIN workflows ON files.workflow_id=workflows.workflow_id '
+           ' WHERE workflows.campaign_id=campaigns.campaign_id'
+           ' AND files.stage_id=1) AS files_total,'
+           '(SELECT COUNT(*) FROM workflows'
+           ' WHERE workflows.campaign_id=campaigns.campaign_id)'
+           ' AS workflows_count '
+           'FROM campaigns '
+           'LEFT JOIN users ON campaigns.user_id=users.user_id '
+           'LEFT JOIN principal_names '
+           'ON principal_names.pn_id=users.main_pn_id '
+           'LEFT JOIN named_quotas ON named_quotas.quota_id=campaigns.quota_id '
+           '%s '
+           'ORDER BY campaigns.campaign_id DESC LIMIT %d,%d' %
+           (whereString, pageNumber * pageLength, pageLength + 1))
+
+##  print(query, file=sys.stderr)
+  justin.cur.execute(query)
+  rows = justin.cur.fetchall()
 
   output += makePager(pageNumber, pageLength, len(rows), 
-                      "%s?method=list-jobscripts&page_number=%d&page_length=%d") 
+                      "/dashboard/?method=list-campaigns&page_number=%d"
+                      "&page_length=%d" + queryList) 
              
-  output += '<p><table class="center">'
-  output += ('<tr><th>Jobscript</th><th>Description</th><th>Author</th>'
-             '<th>Created</th><tr>')
+  output += '<p><table>'
+  output += ('<tr><th>Campaign</th>'
+             '<th>Description</th>'
+             '<th>Quota</th>'
+             '<th>Created&nbsp;by</th>'
+             '<th>Created</th>'
+             '<th>Workflows</th>'
+             '<th>Files Processed</th><tr>')
 
   for row in rows[:pageLength]:
-    if row["scope_name"]:
-      prefix = row["scope_name"]
+    if not row["files_total"]:
+      filesStr = ' '
     else:
-      prefix = row["jobscript_user_name"]
+      filesStr = ('%d/%d (%.1f%%)' % 
+                  (row['files_processed'], row['files_total'],  
+                   100.0 * row['files_processed'] /  row['files_total']))
 
-    output += ('<tr><td><a href="/dashboard/?method=show-jobscript&jobscript_id=%s:%s">'
-               '%s:%s</a></td><td>%s</td><td>%s</td><td>%s</td>'
-               '</tr>'
-               % (prefix, row["jobscript_name"], 
-                  prefix, row["jobscript_name"], 
-                  html.escape(row["description"], quote=True),
-                  row["author_name"],
-                  row['created_time']
-                 )
-              )
+    output += ('<tr><td><a href="/dashboard/?method=show-campaign&campaign_id=%d">'
+       '%d</a></td>'
+       '<td>%s</td>'
+       '<td><a href="/dashboard/?method=show-quota&quota_name=%s">%s</a></td>'
+       '<td>%s</td><td>%s</td>'
+       '<td>%d<td>%s</td></tr>' % 
+          (row["campaign_id"], row["campaign_id"],
+           html.escape(row["description"], quote=True),
+           row["quota_name"], row["quota_name"],
+           row["user_name"],
+           spaceForUnixEpoch(row['created']),
+           row['workflows_count'],
+           filesStr
+          )
+         )
 
   output += "</table>"
   
   output += makePager(pageNumber, pageLength, len(rows), 
-                      "%s?method=list-jobscripts&page_number=%d&page_length=%d")
+                      "/dashboard/?method=list-campaigns&page_number=%d"
+                      "&page_length=%d" + queryList)
   output += footer()
   
   return output
 
-def showJobscript(environ, user, cgiValues):
+def showCampaign(environ, user, cgiValues):
 
   try:
-    jsid = str(cgiValues["jobscript_id"]).lower()
+    campaignID = int(cgiValues['campaign_id'])
   except:
-    return errorPage(environ, user, "jobscript_id must be given")
+    return errorPage(environ, user, "campaign_id must be given")
 
-  response = justin.lookupJobscript(jsid)
-  if response['error']:
-    return errorPage(environ, user, response['error'])
+  output = header(environ, user, "justIN: Campaign %d" % campaignID)
 
-  output = header(environ, user, "justIN: Jobscript %s" % jsid)
-  output += '<!-- %s -->\n' % str(time.time())
-  output += ("<h1>Jobscript %s</h1>\n" % jsid)
+  query = ('SELECT campaigns.description,campaigns.created,principal_name,'
+           'quota_name '
+           'FROM campaigns '
+           'LEFT JOIN named_quotas '
+           'ON named_quotas.quota_id=campaigns.quota_id '
+           'LEFT JOIN users ON campaigns.user_id=users.user_id '
+           'LEFT JOIN principal_names '
+           'ON principal_names.pn_id=users.main_pn_id '
+           'WHERE campaign_id=%d' % campaignID)
 
-  output += ("<p><i>Created on %s by %s</i><br>%s</p>\n"
-             % (response['created_time'], 
-                response['authorname'],
-                html.escape(response['description'], quote=True)))
+  campaignRow = justin.select(query, justOne = True)
 
-  output += ("<h2>Jobscript</h2>")
-  output += ('<pre style="white-space: pre-wrap;">') 
+  output += "<h1>Campaign %d</h1>" % campaignID
 
-  output += (html.escape(
-   response["jobscript"].encode('ascii',errors='ignore').decode(), 
-   quote=True))
+  output += '<p><table>'
+  output += '<tr><td>Campaign</td><td>%d</td></tr>' % campaignID
+
+  if (user and (user['user_name'] in justin.justinAdmins or
+                  campaignRow['quota_name'] in user['quota_names']) ):
+    output += ('<tr><td>Description</td><td>%s</td></tr>' 
+               % inputHTML(cgiValues, user, key = str(campaignID), 
+                   name    = 'campaign_description',
+                   value   = campaignRow['description'], 
+                   size    = 20, 
+                   nextURI = '/dashboard/?method=show-campaign&campaign_id=%d'
+                             % campaignID))
+  else:
+    output += ('<tr><td>Description</td><td>%s</td></tr>' 
+               % html.escape(campaignRow['description'], quote=True))
+
+  output += ('<tr><td>Named quota</td><td>'
+             '<a href="/dashboard/?method=show-quota&quota_name=%s">%s</a></td></tr>' % 
+             (campaignRow['quota_name'], campaignRow['quota_name']))
+  output += ('<tr><td>Created</td><td>%s</td></tr>' % 
+             campaignRow['created'])
+  output += ('<tr><td>Created&nbsp;by</td><td>%s</td></tr>' % 
+             campaignRow['principal_name'])
+  output += '</table></p>'
   
-  output += ('</pre>') 
-
-  output += footer()
-  return output
-
-def listWorkflows(environ, user, cgiValues, pageNumber, pageLength):
-
-  output = header(environ, user, "justIN: Workflows")
-
-  output += "<h1>Workflows</h1>"
-  
+  pageLength = 100
   query = ('SELECT workflow_id,description,principal_name AS user_name,'
-           'state,mql,created,submitted,started,finished '
+           'workflows.state,mql,started,finished,scope_name,'
+           '(SELECT COUNT(*) FROM files'
+           ' WHERE files.workflow_id=workflows.workflow_id'
+           ' AND files.stage_id=1 '
+           ' AND files.state="processed") AS files_processed,'
+           '(SELECT COUNT(*) FROM files'
+           ' WHERE files.workflow_id=workflows.workflow_id'
+           ' AND files.stage_id=1) AS files_total '
            'FROM workflows '
            'LEFT JOIN users ON workflows.user_id=users.user_id '
            'LEFT JOIN principal_names '
            'ON principal_names.pn_id=users.main_pn_id '
+           'LEFT JOIN scopes ON workflows.scope_id=scopes.scope_id '
+           'LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id '
+           'WHERE campaign_id=%d '
+           'ORDER BY workflow_id DESC LIMIT %d' % 
+           (campaignID, pageLength))
+
+  justin.cur.execute(query)
+  rows = justin.cur.fetchall()
+             
+  output += '<h2>Workflows within this campaign</h2>'
+  output += '<p><table>'
+  output += ('<tr><th>Workflow</th><th>Description</th>'
+             '<th>User</th>'
+             '<th>Scope</th><th>State</th>'
+             '<th>MQL</th><th>Files Processed</th><th>Started</th>'
+             '<th>Finished</th><tr>')
+
+  filesTotalProcessed = 0
+  filesGrandTotal     = 0
+
+  for row in rows:
+    if not row["files_total"]:
+      filesStr = ' '
+    else:
+      filesTotalProcessed += row['files_processed']
+      filesGrandTotal     += row["files_total"]
+
+      filesStr = ('%d/%d (%.1f%%)' % 
+                  (row['files_processed'], row['files_total'],  
+                   100.0 * row['files_processed'] /  row['files_total']))
+
+    output += ('<tr><td><a href="/dashboard/?method=show-workflow'
+          '&workflow_id=%s">'
+          '%s</a></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>'
+          '<td>%s</td><td>%s</td>'
+          '<td>%s</td><td>%s</td>'
+          '</tr>' % 
+          (row["workflow_id"], row["workflow_id"],
+           html.escape(row["description"], quote=True),
+           row["user_name"],
+           row["scope_name"],
+           row["state"],
+           insertWBR(row["mql"]),
+           filesStr,
+           spaceForUnixEpoch(row['started']),
+           spaceForUnixEpoch(row['finished'])
+          )
+         )
+
+  output += "</table>"
+
+  if len(rows) > pageLength:
+    # Warn people if it's just a subset!
+    output += ('<p>This page only shows the most recent %d workflows of '
+               'this campaign</p>' % pageLength)
+
+  elif filesGrandTotal > 0: 
+    output += ('<p>%d file%s processed out of %d input file%s = %.1f%%</p>'
+               % (filesTotalProcessed, 
+                  ('s' if filesTotalProcessed != 1 else ''), 
+                  filesGrandTotal, 
+                  ('s' if filesGrandTotal != 1 else ''), 
+                  100.0 * filesTotalProcessed / filesGrandTotal))
+  
+    output += ('<p>You can download this list as '
+               '<a href="/dashboard/?method=download-campaign-workflows'
+               '&campaign_id=%d&format=csv&csvfile=">CSV</a> or '
+               '<a href="/dashboard/?method=download-campaign-workflows'
+               '&campaign_id=%d&format=json">JSON</a></p>'
+               % (campaignID, campaignID))
+
+  output += footer()
+  
+  return output
+
+def listWorkflows(environ, user, cgiValues, pageNumber, pageLength):
+
+  whereList = []
+  queryList = ''
+
+  try:
+    userName = cgiValues["user_name"]
+
+    if userName != '--ANY--' and not justin.stringIsUsername(userName):
+      raise
+  except:
+    userName = ''
+
+  if userName:
+    # If the user name was given explicitly, then we pass it on
+    # Otherwise it is left out for subsequent next page etc clicks
+    queryList += '&user_name=%s' % userName
+  else:
+    # But userName must be set to something, even just --ANY--
+    if user:
+      # User is logged in, so we use their name instead of implicit --ANY--
+      userName = user['user_name']
+    else:
+      # Always fall back to any user
+      userName = '--ANY--'
+
+  if userName != '--ANY--':
+    # For any user, we just skip this condition 
+    whereList.append('principal_name="%s"' % userName)
+
+  try:
+    campaignID = int(cgiValues["campaign_id"])
+  except:
+    campaignID = ''
+  else:
+    if campaignID:
+      whereList.append('workflows.campaign_id=%d' % campaignID)
+      queryList += '&campaign_id=' + str(campaignID)
+
+  try:
+    scopeName = cgiValues["scope_name"]
+
+    if not justin.stringIsScope(scopeName):
+      raise
+  except:
+    scopeName = ''
+  else:
+    if scopeName:
+      whereList.append('scope_name="%s"' % scopeName)
+      queryList += '&scope_name=%s' % scopeName
+
+  try:
+    quotaName = cgiValues["quota_name"]
+
+    if not justin.stringIsScope(quotaName):
+      raise
+  except:
+    quotaName = ''
+  else:
+    if quotaName:
+      whereList.append('quota_name="%s"' % quotaName)
+      queryList += '&quota_name=%s' % quotaName
+
+  try:
+    workflowState = cgiValues["state"]
+
+    if workflowState not in justin.workflowStates:
+      raise
+  except:
+    workflowState = ''
+  else:
+    if workflowState:
+      whereList.append('state="%s"' % workflowState)
+      queryList += '&state=%s' % workflowState
+
+  if whereList:
+    whereString = ' WHERE ' + ' AND '.join(whereList)
+  else:
+    whereString = ''
+
+  # These lists are used for the pull down menus in the filter HTML
+  userRows = justin.select('SELECT principal_name FROM users '
+                           'LEFT JOIN principal_names '
+                           'ON users.main_pn_id=principal_names.pn_id '
+                           'ORDER BY principal_name')
+  scopeRows = justin.select('SELECT scope_name FROM scopes '
+                            'ORDER BY scope_name')
+  quotaRows = justin.select('SELECT quota_name FROM named_quotas '
+                            'WHERE for_justin ORDER BY quota_name')
+
+  output = header(environ, user, "justIN: Workflows")
+
+  output += "<h1>Workflows</h1>"
+
+  output += ('<p><form method="get" formaction="/dashboard/">'
+    '<input type="hidden" name="method" value="list-workflows">'
+    '<label>User:<select name="user_name">'
+    '<option value="--ANY--"%s>ANY</option>'
+    % (' selected' if userName == '--ANY--' else ''))
+
+  if user:
+    # If logged in, offer their own name first
+    output += ('<option value="%s"%s>%s</option>' 
+               % (user['user_name'],
+                  ' selected' 
+                  if user['user_name'] == userName
+                  else '',
+                  user['user_name']))
+
+  output += '<option value="" disabled>---</option>'
+
+  for userRow in userRows:
+    # List the other user names, selecting them if selected BUT not if
+    # its the logged in user since that is at the top of the list already
+    output += ('<option value="%s"%s>%s</option>' 
+               % (userRow['principal_name'],
+                  ' selected' 
+                  if userRow['principal_name'] == userName and 
+                  (not user or user['user_name'] != userRow['principal_name'])
+                  else '',
+                  userRow['principal_name']))
+
+  output += ('</select></label> '
+    '<label>Scope:<select name="scope_name">'
+    '<option value=""%s>ANY</option>'
+    % ('' if scopeName else ' selected'))
+  
+  for scopeRow in scopeRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (scopeRow['scope_name'],
+                  ' selected' 
+                  if scopeRow['scope_name'] == scopeName
+                  else '',
+                  scopeRow['scope_name']))
+
+  output += ('</select></label> '
+    '<label>Quota:<select name="quota_name">'
+    '<option value=""%s>ANY</option>'
+    % ('' if quotaName else ' selected'))
+  
+  for quotaRow in quotaRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (quotaRow['quota_name'],
+                  ' selected' 
+                  if quotaRow['quota_name'] == quotaName
+                  else '',
+                  quotaRow['quota_name']))
+
+  output += ('</select></label> '
+    '<label>State:<select name="state">'
+    '<option value=""%s>ANY</option>'
+    % ('' if workflowState else ' selected'))
+  
+  for state in justin.workflowStates:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (state,
+                  ' selected' if state == workflowState else '',
+                  state))
+
+  output += '</select></label> '
+
+  output += ('<label>Campaign&nbsp;ID:<input type="number" name="campaign_id" '
+             'min="1" max="99999" step="1" value="%s"></label> ' %
+             (str(campaignID) if campaignID else ''))
+
+  output += ('<input type="submit" value="Filter" '
+    'style="background: #E1703D; border-radius: 5px; padding: 5px; '
+    'color: white; font-weight: bold; font-size: 1em; border: 0; '
+    'cursor: pointer"></form></p>\n')
+  
+  query = ('SELECT workflow_id,description,principal_name AS user_name,'
+           'workflows.state,mql,created,submitted,started,finished,scope_name,'
+           'campaign_id,quota_name,'
+           '(SELECT COUNT(*) FROM files'
+           ' WHERE files.workflow_id=workflows.workflow_id'
+           ' AND files.stage_id=1 '
+           ' AND files.state="processed") AS files_processed,'
+           '(SELECT COUNT(*) FROM files'
+           ' WHERE files.workflow_id=workflows.workflow_id'
+           ' AND files.stage_id=1) AS files_total '
+           'FROM workflows '
+           'LEFT JOIN users ON workflows.user_id=users.user_id '
+           'LEFT JOIN principal_names '
+           'ON principal_names.pn_id=users.main_pn_id '
+           'LEFT JOIN scopes ON workflows.scope_id=scopes.scope_id '
+           'LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id '
+           '%s '
+           'ORDER BY workflow_id DESC LIMIT %d,%d' %
+           (whereString, pageNumber * pageLength, pageLength + 1))
+
+  justin.cur.execute(query)
+  rows = justin.cur.fetchall()
+
+  output += makePager(pageNumber, pageLength, len(rows), 
+                      "/dashboard/?method=list-workflows&page_number=%d"
+                      "&page_length=%d" + queryList) 
+             
+  output += '<p><table>'
+  output += ('<tr><th>Workflow</th><th>Description</th>'
+             '<th>Campaign</th><th>User</th>'
+             '<th>Scope / Quota</th><th>State</th>'
+             '<th>MQL</th><th>Files Processed</th><th>Started</th>'
+             '<th>Finished</th><tr>')
+
+  for row in rows[:pageLength]:
+    if not row["files_total"]:
+      filesStr = ' '
+    else:
+      filesStr = ('%d/%d (%.1f%%)' % 
+                  (row['files_processed'], row['files_total'],  
+                   100.0 * row['files_processed'] /  row['files_total']))
+
+    output += ('<tr><td><a href="/dashboard/?method=show-workflow'
+          '&workflow_id=%s">'
+          '%s</a></td><td>%s</td><td>%s</td><td>%s</td><td>%s / %s</td>'
+          '<td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>'
+          '</tr>' % 
+          (row["workflow_id"], row["workflow_id"],
+           html.escape(row["description"], quote=True),
+           ('<a href="/dashboard/?method=show-campaign&campaign_id=%d">%d</a>'
+              % (row["campaign_id"], row["campaign_id"])) 
+             if row["campaign_id"] else '',
+           row["user_name"],
+           row["scope_name"], row["quota_name"],
+           row["state"],
+           insertWBR(row["mql"]),
+           filesStr,
+           spaceForUnixEpoch(row['started']),
+           spaceForUnixEpoch(row['finished'])
+          )
+         )
+
+  output += "</table>"
+   
+  output += makePager(pageNumber, pageLength, len(rows), 
+                      "/dashboard/?method=list-workflows&page_number=%d"
+                      "&page_length=%d" + queryList)
+  output += footer()
+  
+  return output
+
+def listArchivedWorkflows(environ, user, cgiValues, pageNumber, pageLength):
+
+  output = header(environ, user, "justIN: Archived workflows")
+
+  output += "<h1>Archived workflows</h1>"
+  
+  query = ('SELECT workflow_id,description,user_name,'
+           'state,created FROM archived_workflows '
            'ORDER BY workflow_id DESC LIMIT %d,%d' %
            (pageNumber * pageLength, pageLength + 1))
 
@@ -952,34 +1596,30 @@ def listWorkflows(environ, user, cgiValues, pageNumber, pageLength):
   rows = justin.cur.fetchall()
 
   output += makePager(pageNumber, pageLength, len(rows), 
-                      "/dashboard/?method=list-workflows&page_number=%d&page_length=%d") 
+                      "/dashboard/?method=list-archived-workflows"
+                      "&page_number=%d&page_length=%d") 
              
   output += '<p><table>'
-  output += ('<tr><th>Workflow ID</th><th>Description</th><th>User</th><th>State</th>'
-             '<th>MQL</th><th>Created</th><th>Submitted</th><th>Started</th>'
-             '<th>Finished</th><tr>')
+  output += ('<tr><th>Workflow ID</th><th>Description</th><th>User</th>'
+             '<th>State</th><th>Created</th></tr>')
 
   for row in rows[:pageLength]:
-    output += ('<tr><td><a href="/dashboard/?method=show-workflow&workflow_id=%s">'
-          '%s</a></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td>'
-          '<td>%s</td><td>%s</td><td>%s</td><td>%s</td>'
-          '</tr>' % 
+    output += ('<tr><td><a href="/dashboard/?method=show-archived-workflow'
+          '&workflow_id=%d">%d</a></td>'
+          '<td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % 
           (row["workflow_id"], row["workflow_id"],
            html.escape(row["description"], quote=True),
            row["user_name"],
            row["state"],
-           html.escape(row["mql"], quote=True),
-           spaceForUnixEpoch(row['created']),
-           spaceForUnixEpoch(row['submitted']),
-           spaceForUnixEpoch(row['started']),
-           spaceForUnixEpoch(row['finished'])
+           row['created']
           )
          )
 
   output += "</table>"
   
   output += makePager(pageNumber, pageLength, len(rows), 
-                      "/dashboard/?method=list-workflows&page_number=%d&page_length=%d")
+                      "/dashboard/?method=list-archived-workflows"
+                      "&page_number=%d&page_length=%d")
   output += footer()
   
   return output
@@ -990,41 +1630,189 @@ def showWorkflow(environ, user, cgiValues):
   except:
     return errorPage(environ, user, "workflow_id must be given")
   
-  output = header(environ, user, "justIN: Workflow %d" % workflowID)
-
-  query = ("SELECT workflows.description,workflows.state,"
-           "principal_name AS user_name,"
+  query = ("SELECT workflows.description AS workflow_description,"
+           "workflows.state,"
+           "workflows.state_message,principal_name AS user_name,"
+           "workflows.user_id,wlcg_groups.wlcg_group_name,"
            "workflows.created,workflows.submitted,workflows.started,"
            "workflows.checking,workflows.finished,mql,"
            "workflows.refind_seconds,workflows.refind_end_time,"
-           "workflows.refind_next_time,"
-           "scopes.scope_name,condor_groups.condor_group_name "
+           "workflows.refind_next_time,quota_name,scopes.quota_id,"
+           "scopes.scope_name,condor_groups.condor_group_name,"
+           "workflows.campaign_id,"
+           "campaigns.description AS campaign_description,"
+           "(SELECT COUNT(*) FROM workflows AS workflows2 "
+           "WHERE workflows2.campaign_id=workflows.campaign_id) "
+           "AS campaign_count "
            "FROM workflows "
            "LEFT JOIN scopes ON scopes.scope_id=workflows.scope_id "
+           "LEFT JOIN named_quotas ON scopes.quota_id=named_quotas.quota_id "
+           "LEFT JOIN wlcg_groups "
+           "ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id "
            "LEFT JOIN users ON users.user_id=workflows.user_id "
            "LEFT JOIN principal_names "
            "ON principal_names.pn_id=users.main_pn_id "
            "LEFT JOIN condor_groups "
-           "ON condor_groups.condor_group_id=workflows.condor_group_id "
+           "ON condor_groups.condor_group_id=scopes.condor_group_id "
+           "LEFT JOIN campaigns "
+           "ON campaigns.campaign_id=workflows.campaign_id "
            "WHERE workflow_id=%d "
            "ORDER BY workflow_id" % workflowID)
 
-  justin.cur.execute(query)
-  workflowRow = justin.cur.fetchone()
+  workflowRow = justin.select(query, justOne = True)
+
+  if workflowRow is None:
+    # This workflow was not found!
+    return ('/dashboard/?method=show-archived-workflow&workflow_id=%d'
+            % workflowID)
   
-  state = workflowRow['state']
+  output     = header(environ, user, "justIN: Workflow %d" % workflowID)
+  state      = workflowRow['state']
+  campaignID = int(workflowRow['campaign_id'])
+
+  campaignDescription = workflowRow['campaign_description']
+  if campaignDescription is None:
+    campaignDescription = ''
 
   output += "<h1>Workflow %d</h1>" % workflowID
+
+# WE DISABLE THESE OPTIONS FOR NOW. THEY NEED CHANGING FROM BUTTONS TO
+# TWO STEP CONFIRMATION: SELECT FROM MENU THEN A BUTTON MAYBE???
+  if False and user:
+    buttonsHTML = ''
+
+    # Buttons you need to be an admin or in the group still for
+    if user['user_name'] in justin.justinAdmins or \
+       workflowRow['wlcg_group_name'] in user['wlcg_groups']:
+      if workflowRow['state'] == 'draft':
+        buttonsHTML += buttonHTML(user = user,
+              nextURI = '/dashboard/?method=show-workflow&workflow_id=%d'
+                                    % workflowID,
+              label   = 'Submit',
+              key     = workflowID,
+              name    = 'workflow_submit') + ' '
+
+      if workflowRow['state'] == 'paused':
+        buttonsHTML += buttonHTML(user = user,
+              nextURI = '/dashboard/?method=show-workflow&workflow_id=%d'
+                                    % workflowID,
+              label   = 'Restart',
+              key     = workflowID,
+              name    = 'workflow_restart') + ' '
+
+    # Buttons that users can do for any workflow submitted in their name
+    if user['user_name'] in justin.justinAdmins or \
+       workflowRow['wlcg_group_name'] in user['wlcg_groups'] or \
+       user['user_id'] == workflowRow['user_id']:
+
+      if workflowRow['state'] == 'running':
+        buttonsHTML += buttonHTML(user = user,
+              nextURI = '/dashboard/?method=show-workflow&workflow_id=%d'
+                                    % workflowID,
+              label   = 'Pause',
+              key     = workflowID,
+              name    = 'workflow_pause') + ' '
+
+      if workflowRow['state'] in ['running','submitted','draft']:
+        buttonsHTML += buttonHTML(user = user,
+              nextURI = '/dashboard/?method=show-workflow&workflow_id=%d'
+                                    % workflowID,
+              label   = 'Finish',
+              key     = workflowID,
+              name    = 'workflow_finish') + ' ' 
+
+    if buttonsHTML:
+      output += '<p>' + buttonsHTML + '</p>\n<p>\n'
+
   output += '<table>'
-  output += ('<tr><td>Description</td><td>%s</td></tr>' 
-             % html.escape(workflowRow['description'], quote=True))
+
+  output += '<tr><td>Workflow</td><td>%d</td></tr>' % workflowID
+
+  if (user and (user['user_name'] in justin.justinAdmins or
+                  workflowRow['quota_name'] in user['quota_names']) ):
+    output += ('<tr><td>Workflow description</td><td>%s</td></tr>' 
+               % inputHTML(cgiValues, user, key = str(workflowID), 
+                   name    = 'workflow_description',
+                   value   = workflowRow['workflow_description'], 
+                   size    = 20, 
+                   nextURI = '/dashboard/?method=show-workflow&workflow_id=%d'
+                             % workflowID))
+  else:
+    output += ('<tr><td>Workflow description</td><td>%s</td></tr>' 
+               % html.escape(workflowRow['workflow_description'], quote=True))
+
+  if (user and (user['user_name'] in justin.justinAdmins or
+                  workflowRow['quota_name'] in user['quota_names']) ):
+
+    myCampaigns = []
+
+    if workflowRow['campaign_count'] > 1:
+      # If this campaign contains other workflows, give the user the 
+      # option to create a new campaign to move this workflow into
+      myCampaigns.append(('0', 'New campaign'))
+
+    rows = justin.select('SELECT campaign_id,description '
+                           'FROM campaigns '
+                           'WHERE quota_id=%d '
+                           'ORDER BY campaign_id DESC LIMIT 100'
+                           % workflowRow['quota_id'])
+
+    currentCampaignFound = False
+    for row in rows:
+      if row['campaign_id'] == campaignID:
+        currentCampaignFound = True
+
+      myCampaigns.append((str(row['campaign_id']), 
+                          '%d %s' % 
+                          (row['campaign_id'], 
+                           html.escape(row["description"][:20], quote=True))))
+
+    if not currentCampaignFound and campaignID > 0:
+      # Add the current value if not found in the limited list we made
+      myCampaigns.append((str(campaignID), 
+                   '%d %s' % 
+                   (str(campaignID), 
+                    html.escape(campaignDescription[:20],
+                                quote=True)) ))
+
+    output += ('<tr><td>Campaign</td><td>%s</td></tr>' % 
+               selectHTML(cgiValues, user, 
+                    key = str(workflowID),
+                    name = 'workflow_campaign',                   
+                    value = str(campaignID) if campaignID else '',
+    valueURL = ('/dashboard/?method=show-campaign&campaign_id=%d' % campaignID) 
+                if campaignID else None,
+                    options = myCampaigns,
+                    nextURI = '/dashboard/?method=show-workflow&workflow_id=%d'
+                            % workflowID))
+
+  elif campaignID:
+    output += ('<tr><td>Campaign</td><td>'
+               '<a href="/dashboard/?method=show-campaign&campaign_id=%d">'
+               '%d</a></td></tr>' % 
+               (campaignID, campaignID))
+  else:
+    output += '<tr><td>Campaign</td><td> </td></tr>'
+
+  output += ('<tr><td>Campaign description</td><td>%s</td></tr>' %
+                 html.escape(campaignDescription, quote=True))
 
   output += ('<tr><td>State</td><td>%s</td></tr>' % state)
+  if workflowRow['state_message']:
+    output += ('<tr><td>Message</td><td>%s</td></tr>' 
+               % workflowRow['state_message'])
+
   output += ('<tr><td>MQL</td><td>%s</td></tr>' 
              % html.escape(workflowRow['mql'], quote=True))
 
   if workflowRow['scope_name']:
     output += '<tr><td>Scope</td><td>%s</td></tr>' % workflowRow['scope_name']
+
+  if workflowRow['quota_name']:
+    output += ('<tr><td>Named quota</td><td>'
+               '<a href="/dashboard/?method=show-quota&quota_name=%s">'
+               '%s</a></td></tr>' 
+               % (workflowRow['quota_name'], workflowRow['quota_name']))
 
   if workflowRow['condor_group_name']:
     output += ('<tr><td>HTCondor Group</td><td>%s</td></tr>'  
@@ -1040,8 +1828,11 @@ def showWorkflow(environ, user, cgiValues):
     output += ('<tr><td>Next find</td><td>%s</td></tr>'
                % workflowRow['refind_next_time'])
 
-  output += ('<tr><td>%s by</td><td>%s</td></tr>' 
+  output += ('<tr><td>%s by</td><td>'
+             '<a href="/dashboard/?method=show-user&user_name=%s">'
+             '%s</a></td></tr>' 
              % ('Created' if state == 'draft' else 'Submitted',
+                workflowRow['user_name'],
                 workflowRow['user_name']))
 
   output += ('<tr><td>Created</td><td>%s</td></tr>' 
@@ -1058,6 +1849,11 @@ def showWorkflow(environ, user, cgiValues):
 
   output += ('<tr><td>Finished</td><td>%s</td></tr>' 
              % spaceForUnixEpoch(workflowRow['finished']))
+  
+  output += ('<tr><td colspan="2"><a '
+             'href="/dashboard/?method=list-events&workflow_id=%d">Events '
+             'for this workflow</a></td></tr>' 
+             % workflowID)
   
   output += "</table>"
 
@@ -1152,7 +1948,8 @@ def showWorkflow(environ, user, cgiValues):
                          'aborted'           : 0,
                          'stalled'           : 0,
                          'jobscript_error'   : 0,
-                         'outputting_failed' : 0  })
+                         'outputting_failed' : 0,
+                         'none_processed'    : 0  })
 
   query = ('SELECT job_state,stage_id,COUNT(*) AS count '
            'FROM jobs '
@@ -1176,7 +1973,8 @@ def showWorkflow(environ, user, cgiValues):
              '<th>Outputting</th><th>Finished</th>'
              '<th>Notused</th>'
              '<th>Aborted</th><th>Stalled</th><th>Jobscript error</th>'
-             '<th>Outputting failed</th></tr>')
+             '<th>Outputting failed</th>'
+             '<th>None processed</th></tr>')
 
   for stageRow in stageRows:
     output += ('<tr>'
@@ -1204,6 +2002,8 @@ def showWorkflow(environ, user, cgiValues):
         '&stage_id=%d&job_state=jobscript_error">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
         '&stage_id=%d&job_state=outputting_failed">%d</a></td>'
+        '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
+        '&stage_id=%d&job_state=none_processed">%d</a></td>'
         '</tr>'
         % (stageRow["workflow_id"], stageRow["stage_id"], 
             stageRow["stage_id"],
@@ -1217,7 +2017,8 @@ def showWorkflow(environ, user, cgiValues):
              stateCounts[stageRow['stage_id']]['aborted'] +
              stateCounts[stageRow['stage_id']]['stalled'] +
              stateCounts[stageRow['stage_id']]['jobscript_error'] +
-             stateCounts[stageRow['stage_id']]['outputting_failed'],
+             stateCounts[stageRow['stage_id']]['outputting_failed'] +
+             stateCounts[stageRow['stage_id']]['none_processed'],
            stageRow["workflow_id"], stageRow["stage_id"],
             stateCounts[stageRow['stage_id']]['submitted'],
            stageRow["workflow_id"], stageRow["stage_id"],
@@ -1237,9 +2038,58 @@ def showWorkflow(environ, user, cgiValues):
            stageRow["workflow_id"], stageRow["stage_id"],
             stateCounts[stageRow['stage_id']]['jobscript_error'],
            stageRow["workflow_id"], stageRow["stage_id"],
-            stateCounts[stageRow['stage_id']]['outputting_failed']))
+            stateCounts[stageRow['stage_id']]['outputting_failed'],
+           stageRow["workflow_id"], stageRow["stage_id"],
+            stateCounts[stageRow['stage_id']]['none_processed']))
 
   output += ('</table>')
+  output += footer()
+  return output
+
+def showArchivedWorkflow(environ, user, cgiValues):
+  try:
+    workflowID = int(cgiValues['workflow_id'])
+  except:
+    return errorPage(environ, user, "workflow_id must be given")
+  
+  output = header(environ, user, "justIN: Archived workflow %d" % workflowID)
+
+  query = ('SELECT row_name,row_value FROM archived_workflows_rows '
+           'WHERE workflow_id=%d ORDER BY row_number' % workflowID)
+
+  try:
+    rows = justin.select(query)
+  except Exception as e:
+    return errorPage(environ, user, 
+                     'Database error getting workflow %d: %s' 
+                      % (workflowID, str(e)))
+    
+  output += "<h1>Archived workflow %d</h1>" % workflowID
+
+  if not rows:
+    output += '<p>Workflow not found</p>'
+  else:
+    output += '<table>'
+    for row in rows:  
+      if row['row_value'].startswith('<?xml '):
+        # Assume inline SVG
+        output += ('<tr><td>%s</td><td>'
+                   '<figure style="width:800px; display: inline-block">'
+                   '%s</figure></td></tr>'
+                   % (html.escape(row['row_name'], quote=True),
+                      row['row_value']))
+      elif row['row_value'].startswith('#!/'):
+        # Assume jobscript
+        output += ('<tr><td colspan=2>Jobscript<br>'
+                   '<pre>%s</pre></td></tr>'
+                   % html.escape(row['row_value'], quote=True))
+      else:
+        output += ('<tr><td>%s</td><td>%s</td></tr>'
+                   % (html.escape(row['row_name'], quote=True),
+                      html.escape(row['row_value'], quote=True)))
+
+    output += '</table>'
+
   output += footer()
   return output
 
@@ -1260,14 +2110,15 @@ def showStage(environ, user, cgiValues):
   query = ("SELECT "
            "stages.stage_priority,"
            "stages.processors,"
+           "stages.needs_gpu,"
            "stages.wall_seconds,"
            "stages.rss_bytes,"
            "stages.max_distance,"
            "stages_jobscripts.jobscript,"
-           "jobscript_name,"
-           "jobscripts_scopes.scope_name AS jobscripts_scope_name,"
+           "stages.jobscript_git,"
+           "stages.jobscript_image,"
            "workflows_scopes.scope_name AS workflows_scope_name,"
-           "principal_name AS user_name "
+           "workflows.campaign_id "
            "FROM stages "
            "LEFT JOIN workflows "
            "ON workflows.workflow_id=stages.workflow_id "
@@ -1276,13 +2127,6 @@ def showStage(environ, user, cgiValues):
            "LEFT JOIN stages_jobscripts "
            "ON stages_jobscripts.workflow_id=stages.workflow_id "
            "AND stages_jobscripts.stage_id=stages.stage_id "
-           "LEFT JOIN jobscripts_library "
-           "ON jobscripts_library.jobscript_id=stages.jobscript_id "
-           "LEFT JOIN scopes AS jobscripts_scopes "
-           "ON jobscripts_scopes.scope_id=jobscripts_library.scope_id "
-           "LEFT JOIN users ON users.user_id=jobscripts_library.user_id "
-           "LEFT JOIN principal_names "
-           "ON principal_names.pn_id=users.main_pn_id "
            "WHERE stages.workflow_id=%d AND stages.stage_id=%d" %
            (workflowID, stageID))
 
@@ -1297,27 +2141,64 @@ def showStage(environ, user, cgiValues):
   
   output += '<table>'
 
+  output += ('<tr><td>Workflow</td><td>'
+             '<a href="/dashboard/?method=show-workflow&workflow_id=%d">'
+             '%d</a></td></tr>' % (workflowID, workflowID))
+
+  if stageRow['campaign_id']: 
+    output += ('<tr><td>Campaign</td><td>%d</td></tr>' % 
+                stageRow['campaign_id'])
+
   output += ('<tr><td>Priority</td>'
         '<td>%d</td></tr>' % stageRow["stage_priority"])
 
   output += ('<tr><td>Processors</td>'
         '<td>%s</td></tr>' % stageRow["processors"])
 
+  if stageRow["needs_gpu"]:
+    output += ('<tr><td>GPU required</td><td>Yes</td></tr>')
+
   output += ('<tr><td>Wall seconds</td>'
         '<td>%s</td></tr>' % stageRow["wall_seconds"])
 
+  output += ('<tr><td>Image</td>'
+        '<td>%s</td></tr>' % stageRow["jobscript_image"])
+
   output += ('<tr><td>RSS bytes</td>'
-        '<td>%s (%d MB)</td></tr>' % 
+        '<td>%s (%d MiB)</td></tr>' % 
         (stageRow["rss_bytes"], 
          int(stageRow["rss_bytes"]) / 1048576))
 
   output += ('<tr><td>Max distance for inputs</td>'
         '<td>%.1f</td></tr>' % stageRow["max_distance"])
 
-  output += ('<tr><td>Output RSEs</td>'
-        '<td>')
+  # Allowed input RSEs
+  output += ('<tr><td>Enabled input RSEs</td><td><small>')
         
   query = ("SELECT rse_name "
+           "FROM stages_input_storages "
+           "LEFT JOIN storages "
+           "ON stages_input_storages.rse_id=storages.rse_id "
+           "WHERE workflow_id=%d AND stage_id=%d "
+           "ORDER BY rse_name" %
+           (workflowID, stageID))
+
+  output += '<!-- %s -->\n' % str(time.time())
+  justin.cur.execute(query)
+  rseRows = justin.cur.fetchall()
+
+  storagesList = []  
+  for rseRow in rseRows:
+    storagesList.append(
+             '<a href="/dashboard/?method=show-storage&rse_name=%s">%s</a>' 
+             % (rseRow['rse_name'], rseRow['rse_name']))
+       
+  output += ', '.join(storagesList) + '</small></td></tr>'
+        
+  # Allowed output RSEs
+  output += ('<tr><td>Enabled output RSEs</td><td><small>')
+        
+  query = ("SELECT rse_name,preferred "
            "FROM stages_output_storages "
            "LEFT JOIN storages "
            "ON stages_output_storages.rse_id=storages.rse_id "
@@ -1328,28 +2209,59 @@ def showStage(environ, user, cgiValues):
   output += '<!-- %s -->\n' % str(time.time())
   justin.cur.execute(query)
   rseRows = justin.cur.fetchall()
-  
-  if (len(rseRows) == 0):
-    output += ("(any)")
-  else:
-    for rseRow in rseRows:
-      output += ("%s " % rseRow['rse_name'])
+
+  storagesList = []  
+  for rseRow in rseRows:
+    storagesList.append(
+          '%s<a href="/dashboard/?method=show-storage&rse_name=%s">%s</a>%s' % 
+          ('<b>' if rseRow['preferred'] else '',
+           rseRow['rse_name'],
+           rseRow['rse_name'],
+           '</b>' if rseRow['preferred'] else ''))
+       
+  output += ', '.join(storagesList) + '</small></td></tr>'
         
-  output += ('</td></tr>')
+  # Allowed sites
+  output += ('<tr><td>Enabled sites</td><td><small>')
+        
+  query = ("SELECT site_name "
+           "FROM stages_sites "
+           "LEFT JOIN sites "
+           "ON stages_sites.site_id=sites.site_id "
+           "WHERE workflow_id=%d AND stage_id=%d "
+           "ORDER BY site_name" %
+           (workflowID, stageID))
+
+  output += '<!-- %s -->\n' % str(time.time())
+  justin.cur.execute(query)
+  siteRows = justin.cur.fetchall()
+
+  sitesList = []  
+  for siteRow in siteRows:
+    sitesList.append('<a href="/dashboard/?method=show-site&site_name=%s">'
+                     '%s</a>' % (siteRow['site_name'], siteRow['site_name']))
+       
+  output += ', '.join(sitesList) + '</small></td></tr>'
         
   if stageRow["workflows_scope_name"]:
     output += ('<tr><td>Scope</td>'
                '<td>%s</td></tr>' % stageRow["workflows_scope_name"])
 
+
+  output += ('<tr><td colspan="2"><a '
+             'href="/dashboard/?method=list-events&workflow_id=%d&stage_id=%d">'
+             'Events for this stage</a></td></tr>' 
+             % (workflowID, stageID))
+
   output += ('</table>')
     
   # Output patterns
 
-  query = ("SELECT destination,file_pattern,"
-           "for_next_stage,lifetime_seconds "
+  query = ("SELECT pattern_id,destination,file_pattern,"
+           "for_next_stage,lifetime_seconds,rse_expression "
            "FROM stages_outputs "
            "WHERE workflow_id=%d AND stage_id=%d "
-           "ORDER BY destination,file_pattern" %
+           "ORDER BY pattern_id" %
            (workflowID, stageID))
 
   output += '<!-- %s -->\n' % str(time.time())
@@ -1357,23 +2269,28 @@ def showStage(environ, user, cgiValues):
 
   if patternRows:
     output += ("<h2>Output patterns</h2>")
-    output += ('<table><tr><th>Destination</th><th>Pattern</th>'
-               '<th>Lifetime</th><th>For next stage</th></tr>') 
+    output += ('<table><tr><th>&nbsp;</th><th>Destination</th><th>Pattern</th>'
+               '<th>Lifetime</th><th>For next stage</th>'
+               '<th>RSE expression</th></tr>') 
 
     for patternRow in patternRows:
       if patternRow['destination'].startswith('https://'):
-        output += ("<tr><td>%s</td><td>%s</td>"
-                   "<td> </td><td> </td></tr>" 
-                   % (patternRow["destination"],
+        output += ("<tr><td>%d</td><td>%s</td><td>%s</td>"
+                   "<td> </td><td> </td><td> </td></tr>" 
+                   % (patternRow["pattern_id"], 
+                      insertWBR(patternRow["destination"]),
                       html.escape(patternRow["file_pattern"], quote=True)))
       else:
-        output += ("<tr><td>Rucio %s:%s</td><td>%s</td>"
-                   "<td>%d</td><td>%s</td></tr>" 
-                   % (stageRow["workflows_scope_name"],
-                      patternRow["destination"],
+        output += ("<tr><td>%d</td><td>Rucio %s:%s</td><td>%s</td>"
+                   "<td>%d</td><td>%s</td><td>%s</td></tr>" 
+                   % (patternRow["pattern_id"],
+                      stageRow["workflows_scope_name"],
+                      insertWBR(patternRow["destination"]),
                       html.escape(patternRow["file_pattern"], quote=True),
                       patternRow["lifetime_seconds"],
-                      bool(patternRow["for_next_stage"])))
+                      bool(patternRow["for_next_stage"]),
+                      html.escape(patternRow['rse_expression'])
+                    ))
 
     output += ('</table>')
 
@@ -1416,6 +2333,29 @@ def showStage(environ, user, cgiValues):
       output += ("<tr><td>%s</td><td>%s</td></tr>" %
                  (html.escape(classadRow["classad_name"]),
                   html.escape(classadRow["classad_value"])))
+
+    output += ('</table>') 
+
+  # Git repos
+  query = ("SELECT git_repo,git_commit,rcds_hash,rcds_path "
+           "FROM stages_git_repos "
+           "WHERE workflow_id=%d AND stage_id=%d "
+           "ORDER BY git_repo" %
+           (workflowID, stageID))
+
+  gitReposRows = justin.select(query)
+
+  if gitReposRows:
+    output += '<!-- %s -->\n' % str(time.time())
+    output += ('<h2>GitHub Repos</h2>')
+    output += ('<table><tr><th>Name</th><th>Path</th><th>Commit</th></tr>')
+ 
+    for gitRepoRow in gitReposRows:
+      output += ("<tr><td>%s</td><td>%s</td><td>%s</td></tr>" %
+                 (gitRepoRow['git_repo'],
+                  insertWBR(gitRepoRow['rcds_path']),
+                  gitRepoRow['git_commit']
+                ))
 
     output += ('</table>') 
 
@@ -1472,55 +2412,56 @@ def showStage(environ, user, cgiValues):
 
   output += ("</table>")
 
-  # Job states
+  # Display table of job states for this stage
+  stateCounts = { 'submitted'         : 0,
+                  'started'           : 0,
+                  'processing'        : 0,
+                  'outputting'        : 0,
+                  'finished'          : 0,
+                  'notused'           : 0,
+                  'aborted'           : 0,
+                  'stalled'           : 0,
+                  'jobscript_error'   : 0,
+                  'outputting_failed' : 0,
+                  'none_processed'    : 0  }
 
-  query = ('SELECT '
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="processing") '
-           ' AS number_processing,'
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="outputting") '
-           ' AS number_outputting,'
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="finished") '
-           ' AS number_finished,'
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="aborted") '
-           ' AS number_aborted,'
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="stalled") '
-           ' AS number_stalled,'
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="jobscript_error") '
-           ' AS number_jobscript_error,'
-           '(SELECT COUNT(*) FROM jobs WHERE workflow_id=%d AND '
-           ' stage_id=%d AND job_state="outputting_failed") '
-           ' AS number_outputting_failed'
-           % (workflowID, stageID, 
-              workflowID, stageID,
-              workflowID, stageID,
-              workflowID, stageID,
-              workflowID, stageID,
-              workflowID, stageID,
-              workflowID, stageID))
-
-  output += '<!-- %s SELECT (SELECT -->\n' % str(time.time())
-  justin.cur.execute(query)
-  jobNumberRow = justin.cur.fetchone()
+  query = ('SELECT job_state,COUNT(*) AS count FROM jobs '
+           'WHERE workflow_id=%d AND stage_id=%d '
+           'GROUP BY job_state' % (workflowID, stageID))
+             
+  stateRows = justin.select(query)
+  
+  for stateRow in stateRows:
+    stateCounts[stateRow['job_state']]  = stateRow['count']
 
   output += ('<h2>Job states</h2>')
   output += ('<table>')
-  output += ('<tr><th>Processing</th><th>Outputting</th><th>Finished</th>'
-        '<th>Aborted</th><th>Stalled</th><th>Jobscript error</th>'
-        '<th>Outputting failed</th></tr>')
+  output += ('<tr><th>Total</th>'
+             '<th>Submitted</th>'
+             '<th>Started</th>'
+             '<th>Processing</th>'
+             '<th>Outputting</th>'
+             '<th>Finished</th>'
+             '<th>Notused</th>'
+             '<th>Aborted</th><th>Stalled</th><th>Jobscript error</th>'
+             '<th>Outputting failed</th>'
+             '<th>None processed</th></tr>')
 
   output += ('<tr>'
+        '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
+        '&stage_id=%d">%d</a></td>'
+        '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
+        '&stage_id=%d&job_state=submitted">%d</a></td>'
+        '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
+        '&stage_id=%d&job_state=started">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
         '&stage_id=%d&job_state=processing">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
         '&stage_id=%d&job_state=outputting">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
         '&stage_id=%d&job_state=finished">%d</a></td>'
+        '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
+        '&stage_id=%d&job_state=notused">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
         '&stage_id=%d&job_state=aborted">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
@@ -1529,15 +2470,43 @@ def showStage(environ, user, cgiValues):
         '&stage_id=%d&job_state=jobscript_error">%d</a></td>'
         '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
         '&stage_id=%d&job_state=outputting_failed">%d</a></td>'
+        '<td><a href="/dashboard/?method=list-jobs&workflow_id=%d'
+        '&stage_id=%d&job_state=none_processed">%d</a></td>'
         '</tr>'
-        % (workflowID, stageID, jobNumberRow['number_processing'],
-           workflowID, stageID, jobNumberRow['number_outputting'],
-           workflowID, stageID, jobNumberRow['number_finished'],
-           workflowID, stageID, jobNumberRow['number_aborted'],
-           workflowID, stageID, jobNumberRow['number_stalled'],
-           workflowID, stageID, jobNumberRow['number_jobscript_error'],
-           workflowID, stageID, jobNumberRow['number_outputting_failed']
-          ))
+        % (workflowID, stageID, 
+             stateCounts['submitted'] +
+             stateCounts['started'] +
+             stateCounts['processing'] +
+             stateCounts['outputting'] +
+             stateCounts['finished'] +
+             stateCounts['notused'] +
+             stateCounts['aborted'] +
+             stateCounts['stalled'] +
+             stateCounts['jobscript_error'] +
+             stateCounts['outputting_failed'] +
+             stateCounts['none_processed'],
+           workflowID, stageID,
+            stateCounts['submitted'],
+           workflowID, stageID,
+            stateCounts['started'],
+           workflowID, stageID,
+            stateCounts['processing'],
+           workflowID, stageID,
+            stateCounts['outputting'],
+           workflowID, stageID,
+            stateCounts['finished'],
+           workflowID, stageID,
+            stateCounts['notused'],
+           workflowID, stageID,
+            stateCounts['aborted'],
+           workflowID, stageID,
+            stateCounts['stalled'],
+           workflowID, stageID,
+            stateCounts['jobscript_error'],
+           workflowID, stageID,
+            stateCounts['outputting_failed'],
+           workflowID, stageID,
+            stateCounts['none_processed']))
 
   output += ('</table>')
 
@@ -1746,18 +2715,18 @@ def showStage(environ, user, cgiValues):
 
   output += ("<h2>Jobscript</h2>")
 
-  if stageRow['jobscripts_scope_name'] and stageRow['jobscript_name']:
-    output += ('<p><i>Copied from '
-               '<a href="/dashboard/?method=show-jobscript&jobscript_id=%s:%s">%s:%s</a>'
-               ' when the stage was created.</i></p>'
-               % (stageRow['jobscripts_scope_name'], stageRow['jobscript_name'],
-                  stageRow['jobscripts_scope_name'], stageRow['jobscript_name']))
-  elif stageRow['user_name'] and stageRow['jobscript_name']:
-    output += ('<p><i>Copied from '
-               '<a href="/dashboard/?method=show-jobscript&jobscript_id=%s:%s">%s:%s</a>'
-               ' when the stage was created.</i></p>'
-               % (stageRow['user_name'], stageRow['jobscript_name'],
-                  stageRow['user_name'], stageRow['jobscript_name']))
+  if stageRow['jobscript_git']:
+    try:
+      (gitSite, orgRepoPath, tag) = stageRow['jobscript_git'].split(':', 2)
+      (org, repo, path)           = orgRepoPath.split('/', 2)
+    except:
+      pass
+    else:
+      output += ('<p><i>Copied from '
+                 '<a href="https://%s/%s/%s/blob/%s/%s">%s/%s/%s:%s</a> '
+                 'on GitHub</i></p>' 
+                 % (gitSite, org, repo, tag, path, 
+                             org, repo, path, tag))
 
   output += ('<pre style="white-space: pre-wrap;">') 
 
@@ -1802,12 +2771,12 @@ def listFiles(environ, user, cgiValues, pageNumber, pageLength):
   query = ("SELECT files.file_did,files.state,"
            "CAST(event_time AS char) AS last_allocation_time,"
            "storages.rse_name,jobs.jobsub_id,"
-           "sites.site_name,"
-           "allocations,jobs.jobscript_exit AS last_jobscript_exit "
+           "sites.site_name,allocations,max_allocations,"
+           "jobs.jobscript_exit AS last_jobscript_exit "
            "FROM files "
            "LEFT JOIN events"
            " ON files.justin_job_id=events.justin_job_id AND"
-           " events.event_type_id=%d "
+           " events.event_type_id=%d AND files.file_id=events.file_id "
            "LEFT JOIN storages ON events.rse_id=storages.rse_id "
            "LEFT JOIN jobs ON jobs.justin_job_id=files.justin_job_id "
            "LEFT JOIN sites ON jobs.site_id=sites.site_id "
@@ -1840,12 +2809,13 @@ def listFiles(environ, user, cgiValues, pageNumber, pageLength):
 
   for fileRow in filesRows[:pageLength]:
       output += ('<tr><td><a href="/dashboard/?method=show-file&workflow_id=%d&stage_id=%d&file_did=%s">'
-          '%s</a></td><td>%d</td><td>%s</td>' % 
+          '%s</a></td><td>%d / %d</td><td>%s</td>' % 
           (workflowID, 
            stageID, 
            urllib.parse.quote(fileRow["file_did"], safe=''),
-           html.escape(fileRow["file_did"], quote=True),
-           fileRow["allocations"], fileRow["state"]
+           insertWBR(fileRow["file_did"]),
+           fileRow["allocations"], fileRow["max_allocations"], 
+           fileRow["state"]
           )
          )
          
@@ -1905,13 +2875,12 @@ def showFile(environ, user, cgiValues):
   except:
     stageID = None
 
-  output = header(environ, user, "justIN: File %s" 
-                  % html.escape(fileDID, quote=True))
+  output = header(environ, user, "justIN: File %s" % insertWBR(fileDID))
 
-  output += ("<h1>File %s</h1>"
-             % html.escape(fileDID, quote=True))
+  output += ("<h1>File %s</h1>" % insertWBR(fileDID))
   
-  query = ('SELECT file_id,state,processed_time,size_bytes '
+  query = ('SELECT file_id,state,processed_time,size_bytes,'
+           'allocations,max_allocations '
            'FROM files '
            'WHERE workflow_id=%d %s AND file_did="%s"' %
            (workflowID, 
@@ -1924,8 +2893,8 @@ def showFile(environ, user, cgiValues):
     fileID = int(fileRow["file_id"])
 
   except Exception as e:
-    return errorPage(environ, user, "invalid file_id (%d,%d,%s): %s\n%s" 
-                     % (workflowID, stageID, fileDID, str(e), query))
+    return errorPage(environ, user, "invalid file_id (%s,%s,%s): %s\n%s" 
+                     % (str(workflowID), str(stageID), fileDID, str(e), query))
 
   query = ("SELECT job_state,jobsub_id,event_time,"
            "site_name,rse_name FROM events "
@@ -1976,19 +2945,22 @@ def showFile(environ, user, cgiValues):
     if replicaRow["lan_pfn"]:
       output += ('<small>%s (wan): %s </small><br>' % 
             (replicaRow["rse_name"], 
-             replicaRow["wan_pfn"]))
+             insertWBR(replicaRow["wan_pfn"])))
       output += ('<small>%s (lan): %s </small><br>' % 
             (replicaRow["rse_name"], 
-             replicaRow["lan_pfn"]))
+             insertWBR(replicaRow["lan_pfn"])))
 
     else:
       output += ('<small>%s: %s </small><br>' % 
             (replicaRow["rse_name"], 
-             replicaRow["wan_pfn"]))
+             insertWBR(replicaRow["wan_pfn"])))
 
   output += '</td></tr>'
 
-  output += '<tr><td>Allocations</td><td>'
+  output += ('<tr><td>Allocations</td><td>%d / %d</td></tr>' 
+             % (fileRow['allocations'], fileRow['max_allocations']))
+
+  output += '<tr><td>Jobs</td><td>' 
   
   for jobRow in jobsRows:
   
@@ -2009,21 +2981,29 @@ def showFile(environ, user, cgiValues):
              '&workflow_id=%d">List file events</a> &nbsp; &nbsp; '
              % (urllib.parse.quote_plus(fileDID), workflowID))
 
-  # THIS IS A BIT OF HACK WHILE HAVE OLD DATASETS AROUND
-  if workflowID > 400 and ':' in fileDID:
-    output += ('<a href="'
-     'https://metacat.fnal.gov:9443/dune_meta_prod/app/gui/show_file?did=%s">'
-     'Find in MetaCat</a>' % urllib.parse.quote_plus(fileDID))
-
-  elif ':' in fileDID:
-    # This test skips monte-carlo-NNNNNN counter DIDs
-    output += ('<a href="'
-     'https://metacat.fnal.gov:9443/dune_meta_demo/app/gui/show_file?did=%s">'
-     'Find in Demo MetaCat</a>' % urllib.parse.quote_plus(fileDID))
+  if ':' in fileDID:
+    output += ('<a href="%s/gui/show_file?did=%s">Find in MetaCat</a>' % 
+       (justin.metacatServerInputsURL, urllib.parse.quote_plus(fileDID)))
 
   output += '</td></tr>'
-
   output += "</table>"  
+
+  try:
+    (scope, name) = fileDID.split(':',1)
+
+    metacatClient = \
+          metacat.webapi.MetaCatClient(justin.metacatServerOutputsURL)
+
+    j = metacatClient.get_file(namespace = scope, name = name,
+                               with_metadata = True, with_provenance = True, 
+                               with_datasets = True)
+
+    output += ('<h2>MetaCat file info</h2>\n<pre>\n' + 
+               pprint.pformat(j) + '</pre>\n')
+  except Exception as e:
+#    output += '<!-- ' + str(e) + ' -->'
+    pass
+
   output += footer()
   return output
 
@@ -2037,20 +3017,52 @@ def outputWrapperLog(startResponse, environ, user):
 
   try:
     filename = environ['REQUEST_URI'].split('/')[2]
-    cluster = int(filename.split('.')[0])
-    proc    = int(filename.split('.')[1])
-    schedd  = filename.split('.',2)[2]
+    cluster  = int(filename.split('.')[0])
+    proc     = int(filename.split('.')[1])
+    schedd   = filename.split('.',2)[2]
     if not justin.stringIsDomain(schedd):
       raise
 
-    output = os.popen('/var/lib/justin/justin-get-output %d %d %s'
-                      % (cluster, proc, schedd), 'r').read()
   except Exception as e:
-   print(environ['REQUEST_URI'], str(e), file=sys.stderr)
-   startResponse('302 Moved', [('Location', '/dashboard/'),
+    print(environ['REQUEST_URI'], str(e), file=sys.stderr)
+    startResponse('302 Moved', [('Location', '/dashboard/'),
                                ('Content-length', '0')
                               ])
-   return('')
+    return('')
+
+  # Try to get cached wrapper log from the database
+  try:
+    row = justin.select('SELECT wrapper_log FROM jobs '
+                        'LEFT JOIN jobs_logs '
+                        'ON jobs.justin_job_id=jobs_logs.justin_job_id '
+                        'WHERE jobsub_id="%d.%d@%s"'
+                        % (cluster, proc, schedd), justOne=True)
+
+  except Exception as e:
+    print(environ['REQUEST_URI'], str(e), file=sys.stderr)
+    startResponse('302 Moved', [('Location', '/dashboard/'),
+                               ('Content-length', '0')
+                              ])
+    return('')
+
+  if row['wrapper_log']:
+    # Use cached wrapper log
+    output = ('Cached log for %d.%d@%s :\n\n' % (cluster, proc, schedd)
+              + str(row['wrapper_log']))
+
+  else:
+    # Not cached so try to get it from HTCondor (for an active job?)
+    try:
+      output = ('Live log for %d.%d@%s :\n\n' % (cluster, proc, schedd)
+                + os.popen('/var/lib/justin/justin-get-output %d %d %s %s'
+                      % (cluster, proc, schedd, 
+                         justin.htcondorCollectors[0]), 'r').read())
+    except Exception as e:
+      print(environ['REQUEST_URI'], str(e), file=sys.stderr)
+      startResponse('302 Moved', [('Location', '/dashboard/'),
+                               ('Content-length', '0')
+                              ])
+      return('')
 
   startResponse('200 OK',
                 [('Content-type',        'text/plain'),
@@ -2074,18 +3086,20 @@ def showJob(environ, user, cgiValues):
            "sites.site_name,entries.entry_name,"
            "jobs.hostname,jobs.cpuinfo,jobs.os_release,"
            "principal_name AS user_name,"
-           "jobs.rss_bytes,jobs.processors,jobs.wall_seconds,"
+           "jobs.rss_bytes,jobs.processors,jobs.wall_seconds,jobs.gpu_info,"
            "jobs.allocator_name,jobs.job_state,jobs.allocation_time,"
            "jobs.submitted_time,jobs.finished_time,jobs.jobsub_state,"
            "jobs.heartbeat_time,jobs.outputting_time,"
            "jobs.site_job_id,"
            "jobs.requested_processors,"
+           "jobs.requested_gpu,"
            "jobs.requested_rss_bytes,"
            "jobs.requested_wall_seconds,jobscript_log,jobs.has_inner_apptainer,"
            "jobs.jobscript_exit,"
            "jobs.jobscript_real_seconds,jobs.jobscript_cpu_seconds,"
            "jobs.jobscript_max_rss_bytes,"
-           "condor_groups.condor_group_name "
+           "wrapper_tries_left,"
+           "LENGTH(wrapper_log) AS wrapper_log_len "
            "FROM jobs "
            "LEFT JOIN workflows ON workflows.workflow_id=jobs.workflow_id "
            "LEFT JOIN users ON workflows.user_id=users.user_id "
@@ -2094,8 +3108,6 @@ def showJob(environ, user, cgiValues):
            "LEFT JOIN sites ON jobs.site_id=sites.site_id "
            "LEFT JOIN entries ON jobs.entry_id=entries.entry_id "
            "LEFT JOIN jobs_logs ON jobs_logs.justin_job_id=jobs.justin_job_id "
-           "LEFT JOIN condor_groups "
-           "ON condor_groups.condor_group_id=workflows.condor_group_id "
            "WHERE jobs.jobsub_id='%s'" % jobsubID)
 
   jobRow = justin.select(query, justOne = True)
@@ -2143,15 +3155,14 @@ def showJob(environ, user, cgiValues):
   output += ('<tr><td>User name</td>'
              '<td colspan="2">%s</td></tr>' % jobRow['user_name'])
 
-  if jobRow['condor_group_name']:
-    output += ('<tr><td>HTCondor Group</td>'
-               '<td colspan="2">%s</td></tr>' % jobRow['condor_group_name'])
-
-  output += ('<tr><td rowspan="3">Requested</td><td>'
+  output += ('<tr><td rowspan="4">Requested</td><td>'
              'Processors</td><td>%d</td></tr>'
              % jobRow["requested_processors"])
 
-  output += ('<tr><td>RSS bytes</td><td>%d (%d MB)</td></tr>'
+  output += ('<tr><td>GPU</td><td>%s</td></tr>' 
+                % ('Yes' if jobRow['requested_gpu'] else 'No'))
+
+  output += ('<tr><td>RSS bytes</td><td>%d (%d MiB)</td></tr>'
              % (jobRow["requested_rss_bytes"],
                 int(jobRow["requested_rss_bytes"]) / 1048576))
 
@@ -2173,8 +3184,9 @@ def showJob(environ, user, cgiValues):
 
   if jobRow["entry_name"]:
     output += ('<tr><td>Entry</td>'
-               '<td colspan="2">%s</td></tr>'
-               % jobRow["entry_name"])
+               '<td colspan="2"><a href="/dashboard/?method=show-entry'
+               '&entry_name=%s">%s</a></td></tr>'
+               % (jobRow["entry_name"], jobRow["entry_name"]))
   else:
     output += '<tr><td>Entry</td><td colspan="2"> </td></tr>'
 
@@ -2183,7 +3195,7 @@ def showJob(environ, user, cgiValues):
                '<td colspan="2">%s</td></tr>'
                % spaceForUnixEpoch(jobRow["heartbeat_time"]))
       
-    output += ('<tr><td rowspan="7">From worker node</td><td>Hostname</td>'
+    output += ('<tr><td rowspan="8">From worker node</td><td>Hostname</td>'
                '<td>%s</td></tr>'
                % html.escape(jobRow["hostname"], quote=True))
   
@@ -2200,7 +3212,7 @@ def showJob(environ, user, cgiValues):
                % jobRow["processors"])
 
     output += ('<tr><td>RSS bytes</td>'
-               '<td>%s (%d MB)</td></tr>' 
+               '<td>%s (%d MiB)</td></tr>' 
                % (jobRow["rss_bytes"], 
                   int(jobRow["rss_bytes"]) / 1048576))
 
@@ -2209,16 +3221,21 @@ def showJob(environ, user, cgiValues):
                % (jobRow["wall_seconds"],
                   int(jobRow["wall_seconds"]) / 3600))
 
+    output += ('<tr><td>GPU</td>'
+                 '<td>%s</td></tr>'
+                 % jobRow["gpu_info"])
+
     output += ('<tr><td>Inner Apptainer?</td>'
                '<td>%s</td></tr>' % bool(jobRow["has_inner_apptainer"]))
 
   output += ('<tr><td>Job state</td>'
              '<td colspan="2">%s</td></tr>'
              % jobRow["job_state"])
-      
-  output += ('<tr><td>Allocator name</td>'
-             '<td colspan="2">%s</td></tr>'
-             % html.escape(jobRow["allocator_name"], quote=True))
+
+# SSCM      
+#  output += ('<tr><td>Allocator name</td>'
+#             '<td colspan="2">%s</td></tr>'
+#             % html.escape(jobRow["allocator_name"], quote=True))
 
   output += ('<tr><td>Started</td>'
              '<td colspan="2">%s</td></tr>'
@@ -2243,7 +3260,7 @@ def showJob(environ, user, cgiValues):
 
   if jobRow["job_state"] in ['outputting', 'outputting_failed', 
                              'jobscript_error', 'finished']:
-    output += ('<tr><td rowspan="3">Jobscript</td>'
+    output += ('<tr><td rowspan="4">Jobscript</td>'
                '<td>Exit code</td>'
                '<td>%d</td></tr>'
                % jobRow["jobscript_exit"])
@@ -2264,6 +3281,12 @@ def showJob(environ, user, cgiValues):
                      ) 
                  )
               )
+      
+    output += ('<tr>'
+               '<td>Max RSS bytes</td>'
+               '<td>%s (%d MiB)</td></tr>' 
+               % (jobRow["jobscript_max_rss_bytes"], 
+                  int(jobRow["jobscript_max_rss_bytes"]) / 1048576))
       
   output += ('<tr><td>Outputting started</td>'
              '<td colspan="2">%s</td></tr>'
@@ -2302,11 +3325,23 @@ def showJob(environ, user, cgiValues):
 
   output += ('<tr><td colspan=3>'
         '<a href="/dashboard/?method=list-events&jobsub_id=%s">'
-        'List job events</a> &nbsp; &nbsp; '
-        '<a href="/wrapperlogs/%s">'
-        'Wrapper job log</a> '
-        '</td></tr>'
-        % (jobsubID, jobsubID.replace('@','.')))
+        'List job events</a> &nbsp; &nbsp; ' % jobsubID)
+
+  if (((jobRow['wrapper_log_len'] is None) or
+       (jobRow['wrapper_log_len'] == 0)) 
+      and
+      ((jobRow['wrapper_tries_left'] is None) or
+       (jobRow['wrapper_tries_left'] == 0))
+     ):
+    output += '(HTCondor job logs unavailable)</td></tr>'
+     
+  else:
+    output += ('<a href="/wrapperlogs/%s">'
+               '%s HTCondor job logs</a>'
+               '</td></tr>'
+               % (jobsubID.replace('@','.'),
+                  'Cached' if jobRow['wrapper_log_len'] else 'Live')
+              )
 
   output += "</table>"
 
@@ -2346,9 +3381,7 @@ def listJobs(environ, user, cgiValues, pageNumber, pageLength):
   except:
     pass
   else:
-    if allocationState in ['submitted','started','processing','outputting',
-                           'finished', 'notused','aborted',
-                           'stalled', 'jobscript_error', 'outputting_failed']:
+    if allocationState in justin.jobStatesAll:
       filters.append('jobs.job_state="%s"' % allocationState)
       urlTemplate += '&job_state=' + allocationState
       titleSuffixes.append('Allocation State %s' % allocationState)
@@ -2362,6 +3395,16 @@ def listJobs(environ, user, cgiValues, pageNumber, pageLength):
       filters.append('sites.site_name="%s"' % siteName)
       urlTemplate += '&site_name=' + siteName
       titleSuffixes.append('Site %s' % siteName)
+
+  try:
+    entryName = cgiValues["entry_name"]
+  except:
+    pass
+  else:
+    if entryName and justin.stringIsSite(entryName):
+      filters.append('entries.entry_name="%s"' % entryName)
+      urlTemplate += '&entry_name=' + entryName
+      titleSuffixes.append('Entry %s' % entryName)
 
   filter = ' AND '.join(filters)
 
@@ -2400,7 +3443,8 @@ def listJobs(environ, user, cgiValues, pageNumber, pageLength):
     except Exception as e:
       output += str(e)
   
-  query = ("SELECT jobs.jobsub_id,jobs.workflow_id,jobs.stage_id,sites.site_name,"
+  query = ("SELECT jobs.jobsub_id,jobs.workflow_id,jobs.stage_id,"
+           "sites.site_name,entries.entry_name,"
            "jobs.job_state,jobs.allocation_time,jobs.submitted_time,"
            "jobs.finished_time,jobs.jobsub_state,jobs.jobscript_exit,"
            "principal_names.principal_name AS user_name "
@@ -2410,6 +3454,7 @@ def listJobs(environ, user, cgiValues, pageNumber, pageLength):
            "LEFT JOIN principal_names "
            "ON principal_names.pn_id=users.main_pn_id "
            "LEFT JOIN sites ON jobs.site_id=sites.site_id "
+           "LEFT JOIN entries ON jobs.entry_id=entries.entry_id "
            "%s "
            "ORDER BY jobs.justin_job_id DESC LIMIT %d,%d" %
            (filter, pageNumber * pageLength, pageLength + 1)
@@ -2425,7 +3470,7 @@ def listJobs(environ, user, cgiValues, pageNumber, pageLength):
   output += ('<tr>'
         '<th>Jobsub ID</th>'
         '<th>Job state</th>'
-        '<th>Site</th>'
+        '<th>Site / Entry</th>'
         '<th>User</th>'
         '<th>Workflow</th>'
         '<th>Stage</th>'
@@ -2464,8 +3509,14 @@ def listJobs(environ, user, cgiValues, pageNumber, pageLength):
   
     if jobRow['site_name']:
       siteNameStr = ('<td><a href="/dashboard/?method=show-site&site_name=%s">'
-                     '%s</a></td>' 
-                     % (jobRow['site_name'], jobRow['site_name']))
+                     '%s</a>%s</td>' 
+                     % (jobRow['site_name'], jobRow['site_name'], 
+                        ('<br><a href="/dashboard/?method=show-entry&'
+                         'entry_name=%s">%s</a>' 
+                         % (jobRow['entry_name'], jobRow['entry_name'])
+                        ) if jobRow['entry_name'] else ''
+                       )
+                    )
     else:
       siteNameStr = '<td> </td>'
 
@@ -2501,35 +3552,418 @@ def listScopes(environ, user, cgiValues):
       
   output = header(environ, user, "justIN: Scopes")
 
-  output += ("<h1>Scopes</h1>")
+  output += ("<h1>Scopes</h1>\n")
+
+  output += ("<p>Scopes available for justIN workflows</p>\n")
   
-  query = ('SELECT scope_name,wlcg_group_name,condor_group_name '
+  query = ('SELECT scope_name,wlcg_group_name,'
+           'scope_condor_groups.condor_group_name AS scope_condor_group_name,'
+           'quota_condor_groups.condor_group_name AS quota_condor_group_name,'
+           'max_files_per_workflow,named_quotas.processing_enabled,'
+           'quota_name,principal_name '
         'FROM scopes '
+        'LEFT JOIN condor_groups AS scope_condor_groups '
+        'ON scope_condor_groups.condor_group_id=scopes.condor_group_id '
+        'LEFT JOIN named_quotas '
+        'ON named_quotas.quota_id=scopes.quota_id '
+        'LEFT JOIN condor_groups AS quota_condor_groups '
+        'ON quota_condor_groups.condor_group_id=named_quotas.condor_group_id '
+        'LEFT JOIN users '
+        'ON named_quotas.user_id=users.user_id '
+        'LEFT JOIN principal_names '
+        'ON principal_names.pn_id=users.main_pn_id '
         'LEFT JOIN wlcg_groups '
-        'ON scopes.wlcg_group_id=wlcg_groups.wlcg_group_id '
-        'LEFT JOIN condor_groups '
-        'ON condor_groups.condor_group_id=scopes.condor_group_id '
-        'ORDER BY scope_name')
+        'ON named_quotas.wlcg_group_id=wlcg_groups.wlcg_group_id '
+        'WHERE scopes.quota_id<>0 AND named_quotas.for_justin '
+        'ORDER BY quota_name,scope_name')
   scopeRows = justin.select(query)
+
+  scopes = []
+  for scopeRow in scopeRows:  
+
+    if scopeRow['wlcg_group_name']:
+      owner = scopeRow['wlcg_group_name']
+    elif scopeRow['principal_name']:
+      owner = scopeRow['principal_name']
+    else:
+      owner = ' '
+
+    scopes.append({ 'scope_name' : scopeRow['scope_name'],
+                    'quota_name' : scopeRow['quota_name'],
+                    'processing_enabled' : 
+                       str(bool(scopeRow['processing_enabled'])),
+                    'owner' : owner,
+               'scope_condor_group_name' : scopeRow['scope_condor_group_name'] 
+                       if scopeRow['scope_condor_group_name'] else ' ',
+               'quota_condor_group_name' : scopeRow['quota_condor_group_name'] 
+                       if scopeRow['quota_condor_group_name'] else ' ',
+                    'max_files_per_workflow' : 
+                       str(scopeRow['max_files_per_workflow']) })
 
   output += ('<table class="center">')
   
   output += ('<tr>'
              '<th>Scope</th>'
-             '<th>WLCG Group</th>'
-             '<th>HTCondor Group</th></tr>')
-  
-  for scopeRow in scopeRows:  
-    output += ('<tr><td>%s</td>'
-               '<td>%s</td>' 
-               '<td>%s</td></tr>' 
-               % (scopeRow['scope_name'],
-                  scopeRow['wlcg_group_name'] 
-                  if scopeRow['wlcg_group_name'] else ' ',
-                  scopeRow['condor_group_name'] 
-                  if scopeRow['condor_group_name'] else ' '))
+             '<th>HTCondor Group</th>'
+             '<th>Quota</th>'
+             '<th>Processing enabled?</th>'
+             '<th>Owner</th>'
+             '<th>Max input files</th></tr>')
 
-  output += ("</table>")
+  startOfQuota = 0
+  endOfQuota = 0
+
+  allCondorGroups = sorted(condorGroupsDict().keys())
+
+  while True:
+
+    if endOfQuota < len(scopes)-1 and \
+      scopes[endOfQuota+1]['quota_name'] == scopes[startOfQuota]['quota_name']:
+      # Not at the end yet, so add one more and try again
+      endOfQuota += 1
+      continue
+
+    # endOfQuota really is now at the end of the current block
+
+    for j in range(startOfQuota, endOfQuota+1):
+      output += '<tr><td>%s</td><td>' % scopes[j]['scope_name']
+
+      if (user 
+          and (user['user_name'] in justin.justinAdmins or
+               scopes[j]['quota_name'] in user['quota_names']) 
+          and scopes[j]['quota_condor_group_name'] != 'group_dune'):
+        myCondorGroups = []
+
+        for condorGroup in allCondorGroups:
+          if condorGroup == scopes[j]['quota_condor_group_name'] or \
+             condorGroup.startswith(scopes[j]['quota_condor_group_name'] + '.'):
+            myCondorGroups.append((condorGroup, condorGroup))
+
+        output += selectHTML(cgiValues, user, 
+                    key = scopes[j]['scope_name'],
+                    name = 'scope_condor_group',
+                    value = scopes[j]['scope_condor_group_name'],
+                    options = myCondorGroups,
+                    nextURI = '/dashboard/?method=list-scopes')
+      else:
+        output += scopes[j]['scope_condor_group_name']
+
+      if j == startOfQuota:
+        # First row has the quota info too  
+        output += ('</td><td style="vertical-align: top" rowspan="%d">'
+               '<a href="/dashboard/?method=show-quota&quota_name=%s">%s</a></td>' 
+               '<td style="vertical-align: top" rowspan="%d">%s</td>' 
+               '<td style="vertical-align: top" rowspan="%d">%s</td>' 
+               '<td style="vertical-align: top" rowspan="%d">%s</td>' 
+               % (1 + endOfQuota - startOfQuota, 
+                  scopes[startOfQuota]['quota_name'], 
+                  scopes[startOfQuota]['quota_name'],
+                  1 + endOfQuota - startOfQuota,
+                  scopes[startOfQuota]['processing_enabled'],
+                  1 + endOfQuota - startOfQuota,
+                  scopes[startOfQuota]['owner'],
+                  1 + endOfQuota - startOfQuota,
+                  scopes[startOfQuota]['max_files_per_workflow'] ))
+      else:
+        # Subsequent rows just have the scope info
+        output += '</td></tr>'
+    
+    if endOfQuota >= len(scopes)-1:
+      # We had already done all the scopes so stop
+      break
+
+    startOfQuota = endOfQuota + 1
+    endofQuota   = startOfQuota
+
+  output += "</table>\n"
+
+  output += footer()
+  return output
+
+def listQuotas(environ, user, cgiValues):
+      
+  output = header(environ, user, "justIN: Named quotas")
+
+  output += ("<h1>Named quotas</h1>\n")
+
+  output += ("<p>Named quotas available for justIN workflows</p>\n")
+  
+  query = ('SELECT wlcg_group_name,condor_group_name,'
+           'max_files_per_workflow,named_quotas.processing_enabled,'
+           'quota_name,principal_name '
+        'FROM named_quotas '
+        'LEFT JOIN wlcg_groups '
+        'ON named_quotas.wlcg_group_id=wlcg_groups.wlcg_group_id '
+        'LEFT JOIN users '
+        'ON named_quotas.user_id=users.user_id '
+        'LEFT JOIN principal_names '
+        'ON principal_names.pn_id=users.main_pn_id '
+        'LEFT JOIN condor_groups '
+        'ON condor_groups.condor_group_id=named_quotas.condor_group_id '
+        'WHERE named_quotas.for_justin '
+        'ORDER BY quota_name')
+
+  quotaRows = justin.select(query)
+
+  output += ('<table class="center">')
+  
+  output += ('<tr>'
+             '<th>Quota</th>'
+             '<th>Processing enabled?</th>'
+             '<th>Owner</th>'
+             '<th>HTCondor Group</th>'
+             '<th>Max input files</th></tr>')
+  
+  for quotaRow in quotaRows:  
+    if quotaRow['wlcg_group_name']:
+      owner = quotaRow['wlcg_group_name']
+    elif quotaRow['principal_name']:
+      owner = quotaRow['principal_name']
+    else:
+      owner = ' '
+
+    output += ('<tr><td><a href="/dashboard/?method=show-quota&quota_name=%s">'
+               '%s</a></td>'
+               '<td>%s</td>' 
+               '<td>%s</td>' 
+               '<td>%s</td>' 
+               '<td>%d</td></tr>' 
+               % (quotaRow['quota_name'], quotaRow['quota_name'],
+                  'Enabled' if quotaRow['processing_enabled'] else 'Disabled',
+                  owner,
+                  quotaRow['condor_group_name'] 
+                  if quotaRow['condor_group_name'] else ' ',
+                  quotaRow['max_files_per_workflow'] ))
+
+  output += ("</table>\n")
+ 
+  output += footer()
+  return output
+
+def showQuota(environ, user, cgiValues):
+      
+  try:
+    quotaName = cgiValues["quota_name"]
+  except:
+    return errorPage(environ, user, "quota_name must be given")
+
+  output = header(environ, user, "justIN: Named quota %s" % quotaName)
+
+  output += ("<h1>Named quota %s</h1>\n" % quotaName)
+  
+  query = ('SELECT wlcg_group_name,condor_group_name,config_quota,'
+           'condor_groups.config_quota,condor_groups.effective_quota,'
+           'max_files_per_workflow,named_quotas.processing_enabled,'
+           'quota_name,principal_name,quota_id,named_quotas.max_running_jobs '
+        'FROM named_quotas '
+        'LEFT JOIN wlcg_groups '
+        'ON named_quotas.wlcg_group_id=wlcg_groups.wlcg_group_id '
+        'LEFT JOIN users '
+        'ON named_quotas.user_id=users.user_id '
+        'LEFT JOIN principal_names '
+        'ON principal_names.pn_id=users.main_pn_id '
+        'LEFT JOIN condor_groups '
+        'ON condor_groups.condor_group_id=named_quotas.condor_group_id '
+        'WHERE quota_name="%s" AND for_justin '
+        'ORDER BY quota_name' % quotaName)
+
+  quotaRow = justin.select(query, justOne = True)
+
+  if not quotaRow:
+    return errorPage(environ, user, "No such quota")
+
+  output += ('<table>')
+  
+  if user and user['user_name'] in justin.justinAdmins:
+    processingButtonHTML = ' ' + buttonHTML(user = user,
+                    nextURI = '/dashboard/?method=show-quota&quota_name=%s'
+                                    % quotaName,
+                    label   = ('Disable' if bool(quotaRow['processing_enabled']) 
+                               else 'Enable'),
+                    key     = quotaRow['quota_id'],
+                    name    = 'set_quota_processing_state', 
+                    value   = not bool(quotaRow['processing_enabled']))
+  else:
+    processingButtonHTML = ''
+
+  output += ('<tr><th colspan=2>Quota</th><th>%s</th></tr>'
+             '<tr><td colspan=2>Processing enabled?</td><td>%s%s</td></tr>' %
+             (
+               quotaRow['quota_name'],
+               'Enabled' if quotaRow['processing_enabled'] else 'Disabled',
+               processingButtonHTML
+             )
+            )
+  
+  if quotaRow['principal_name']:
+    # If a principal_name is available then a per-user quota
+    output +=  ('<tr><td colspan=2>Owned by user</td>'
+               '<td><a href="/dashboard/?method=show-user&user_name=%s">'
+               '%s</a></td></tr>' %
+               (quotaRow['principal_name'], quotaRow['principal_name']))
+
+  else:
+    # Otherwise always assume a per-group quota
+    wlcgGroupName = quotaRow['wlcg_group_name']
+
+    if not wlcgGroupName:
+      wlcgGroupName = ''
+
+    wlcgGroupsList = []
+    for group in sorted(wlcgGroupsDict().keys()):
+      wlcgGroupsList.append((group, group))
+
+    if user and user['user_name'] in justin.justinAdmins:
+      output += ('<tr><td colspan=2>WLCG Group name</td><td>' +
+               selectHTML(cgiValues, user, 
+                    key = quotaRow['quota_name'],
+                    name = 'quota_wlcg_group',
+                    value = wlcgGroupName,
+                    options = wlcgGroupsList,
+                    nextURI = '/dashboard/?method=show-quota&quota_name=%s'
+                               % quotaName) +
+               '</td></tr>')
+    else:
+      output += ('<tr><td colspan=2>WLCG Group name</td><td>%s</td></tr>' 
+                 % wlcgGroupName)
+
+  condorGroupName = quotaRow['condor_group_name']
+  if not condorGroupName:
+    condorGroupName = ''
+
+  if user and user['user_name'] in justin.justinAdmins:
+    condorGroupsList = []
+    for group in sorted(condorGroupsDict().keys()):
+      condorGroupsList.append((group, group))
+
+    output += ('<tr><td rowspan=3>HTCondor</td><td>Group</td><td>%s</td></tr>'
+               % selectHTML(cgiValues, user,
+                    key = quotaRow['quota_name'],
+                    name = 'quota_condor_group',
+                    value = condorGroupName,
+                    options = condorGroupsList,
+                    nextURI = '/dashboard/?method=show-quota&quota_name=%s'
+                               % quotaName)
+              )
+  else:
+    output += ('<tr><td rowspan=3>HTCondor</td><td>Group</td><td>%s</td></tr>'
+               % condorGroupName)
+
+  output += ('<tr><td>Config quota</td><td>%.02f</td></tr>'
+             '<tr><td>Effective quota</td><td>%.02f</td></tr>' %
+              ( quotaRow['config_quota'], quotaRow['effective_quota'] )
+            )
+
+  if user and user['user_name'] in justin.justinAdmins:  
+    output += ('<tr><td colspan=2>Max input files per workflow</td>'
+               '<td>%s</td></tr>' %
+               inputHTML(cgiValues, user, 
+                     key = quotaRow['quota_name'],
+                     name = 'set_quota_max_inputs',
+                     value = quotaRow['max_files_per_workflow'],
+                     size = 6,
+                     nextURI = '/dashboard/?method=show-quota&quota_name=%s'
+                               % quotaName)
+               
+              )
+
+    output += ('<tr><td colspan=2>Max running jobs</td>'
+               '<td>%s</td></tr>' %
+               inputHTML(cgiValues, user, 
+                     key = quotaRow['quota_name'],
+                     name = 'quota_max_running_jobs',
+                     value = quotaRow['max_running_jobs'],
+                     size = 6,
+                     nextURI = '/dashboard/?method=show-quota&quota_name=%s'
+                               % quotaName)
+               
+              )
+  else:
+    output += ('<tr><td colspan=2>Max input files per workflow</td>'
+               '<td>%d</td></tr>' % quotaRow['max_files_per_workflow'])
+  
+    output += ('<tr><td colspan=2>Max running jobs</td>'
+               '<td>%d</td></tr>' % quotaRow['max_running_jobs'])
+  
+  output += ('</table>\n')
+
+  output += '<h2>Storage quota and usage</h2>\n<table>\n'
+
+  output += '<tr><th>RSE</th><th>Usage</th><th>Quota</th><th>Occupancy</th></tr>'
+
+  query = ('SELECT rse_name,bytes,bytes_limit FROM storages_quotas '
+           'LEFT JOIN storages ON storages_quotas.rse_id=storages.rse_id '
+           'WHERE quota_id=%d '
+           'ORDER BY bytes_limit=18446744073709551615,rse_name' 
+           % quotaRow['quota_id'])
+
+  totalBytes   = 0
+  totalLimit   = 0
+  subTotalPrinted = False
+  storageRows  = justin.select(query)
+  
+  for storageRow in storageRows:
+
+    if not subTotalPrinted and storageRow['bytes_limit'] == 18446744073709551615:
+
+      if totalLimit == 0:
+        occ = ' '
+      else:
+        occ = '%.1f%%' % ((100.0 * totalBytes) / totalLimit)
+
+      subTotalPrinted = True
+      output += ('<tr><td><b>Sub total</b></td><td><b>%s</b></td>'
+                 '<td><b>%s</b></td><td><b>%s</b></td></tr>' 
+                 % (justin.bytesToUnits(totalBytes),
+                    justin.bytesToUnits(totalLimit),
+                    occ
+                   )
+                )
+
+    totalBytes += storageRow['bytes']
+    totalLimit += storageRow['bytes_limit']
+
+    if storageRow['bytes_limit'] == 0:
+      bytesLimit = '0'
+      occ = ' '
+    elif  storageRow['bytes_limit'] == 18446744073709551615:
+      bytesLimit = ' '
+      occ = ' '
+    else:
+      bytesLimit = justin.bytesToUnits(storageRow['bytes_limit'])
+      occ = ('%.1f%%' 
+             % ((100.0 * storageRow['bytes']) / storageRow['bytes_limit']))
+
+
+    output += ('<tr><td><a href="/dashboard/?method=show-storage&rse_name=%s">'
+               '%s</a></td><td>%s</td><td>%s</td><td>%s</td></tr>' % 
+               (storageRow['rse_name'], storageRow['rse_name'], 
+                justin.bytesToUnits(storageRow['bytes']), 
+                bytesLimit,
+                occ                
+               )
+              )
+
+
+  if subTotalPrinted:
+    output += ('<tr><td><b>Total<b></td><td colspan="3"><b>%s</b></td></tr>' 
+                 % justin.bytesToUnits(totalBytes))
+  else:
+    if totalLimit == 0:
+      occ = ' '
+    else:
+      occ = '%.1f%%' % ((100.0 * totalBytes) / totalLimit)
+
+    output += ('<tr><td><b>Total</b></td><td><b>%s</b></td>'
+               '<td><b>%s</b></td><td><b>%s</b></td></tr>' 
+                 % (justin.bytesToUnits(totalBytes),
+                    justin.bytesToUnits(totalLimit),
+                    occ
+                   )
+              )
+
+  output += '</table>'
+ 
   output += footer()
   return output
 
@@ -2538,11 +3972,13 @@ def listSites(environ, user, cgiValues):
   output = header(environ, user, "justIN: Sites")
 
   output += ("<h1>Sites</h1>")
+
+  output += ('<p>Or list <a href="/dashboard/?method=list-entries">all '
+             'entries</a>.</p>')
   
   query = ("SELECT DATE(last_osg_seen_time) AS osg_date,"
            "last_get_jobscript_time,"
-           "site_name,sites.enabled,sites.max_rss_bytes,"
-           "sites.max_processors,sites.max_wall_seconds,"
+           "site_name,sites.enabled,"
            "wlcg_site_name,always_inner_apptainer "
            "FROM sites "
            "WHERE sites.site_id > 0 ORDER BY site_name")
@@ -2556,8 +3992,6 @@ def listSites(environ, user, cgiValues):
         '<th>Enabled?</th>'
         '<th>Last job</th>'
         '<th>Seen in OSG</th>'
-        '<th>RSS (MB) / Processors</th>'
-        '<th>Max Wall Seconds</th>'
         '<th>Always has<br>inner<br>apptainer</th>'
         '<th colspan=3>&nbsp;</th>'
         '</tr>')
@@ -2573,8 +4007,6 @@ def listSites(environ, user, cgiValues):
           '<td style="font-weight: %s">%s</td>'
           '<td>%s</td>'
           '<td>%s</td>'
-          '<td style="text-align: right">%d / %d = %d</td>'
-          '<td style="text-align: right">%d (%d hours)</td>'
           '<td>%s</td>'
           '<td><a '
           'href="https://dune-cric.cern.ch/core/experimentsite/detail/%s/">'
@@ -2591,17 +4023,97 @@ def listSites(environ, user, cgiValues):
              'TRUE' if siteRow['enabled'] else 'False',
              lastGetStageStr,
              siteRow['osg_date'],
-             int(siteRow['max_rss_bytes'] / 1048576),
-              siteRow['max_processors'],
-              int((siteRow['max_rss_bytes'] 
-                    / siteRow['max_processors']) / 1048576),
-             siteRow['max_wall_seconds'], 
-                int(siteRow['max_wall_seconds'] / 3600),
              ('' if (siteRow['always_inner_apptainer'] == 1) 
                  else bool(siteRow['always_inner_apptainer'])),
              siteRow['site_name'],
              siteRow['wlcg_site_name'],
              siteRow['site_name']
+            )
+         )    
+
+  output += ("</table>")
+  output += footer()
+  return output
+
+def listEntries(environ, user, cgiValues):
+      
+  output = header(environ, user, "justIN: Entries")
+
+  output += ("<h1>Entries</h1>")
+  
+  output += ('<p>Or list <a href="/dashboard/?method=list-sites">all '
+             'sites</a>.</p>')
+  
+  query = ("SELECT DATE(entries.last_osg_seen_time) AS osg_date,"
+           "entries.last_get_jobscript_time,"
+           "site_name,sites.enabled,entry_name,"
+           "gatekeeper,entry_has_gpus,"
+           "entries.always_inner_apptainer,"
+           "entries.max_processors,entries.max_rss_bytes,"
+           "entries.max_wall_seconds "
+           "FROM entries "
+           "LEFT JOIN sites ON sites.site_id=entries.site_id "
+           "WHERE sites.site_id > 0 ORDER BY site_name,entry_name")
+  
+  entryRows = justin.select(query)
+
+  output += ('<table class="center">')
+  
+  output += ('<tr>'
+        '<th>Site name</th>'
+        '<th>Entry name</th>'
+        '<th>Gatekeeper</th>'
+        '<th>RSS(MiB) / processors</th>'        
+        '<th>Wall seconds limit?</th>'
+        '<th>GPUs</th>'
+        '<th>Last job</th>'
+        '<th>Seen in OSG</th>'
+        '<th>Always has<br>inner<br>apptainer</th>'
+        '</tr>')
+
+  lastSiteName = ''
+  for entryRow in entryRows:  
+    if str(entryRow['last_get_jobscript_time']) == justin.unixEpoch:
+      lastGetStageStr = '&nbsp;'
+    else:
+      lastGetStageStr = str(entryRow['last_get_jobscript_time'])
+
+    if entryRow['site_name'] == lastSiteName:
+      output += '<tr><td>&nbsp;</td>'
+    else:
+      lastSiteName = entryRow['site_name']
+      output += ('<tr>'
+              '<td style="font-weight: %s">'
+              '<a href="/dashboard/?method=show-site&site_name=%s">%s</a></td>'
+              % ('bold' if entryRow['enabled'] else 'normal',
+                 entryRow['site_name'], entryRow['site_name'],
+                )
+                )    
+  
+    output += ('<td><a href="/dashboard/?method=show-entry&entry_name=%s">'
+               '%s</a></td>'
+               '<td>%s</td>'
+               '<td>%d&nbsp;/&nbsp;%d =&nbsp;%d</td>'
+               '<td>%d (%d&nbsp;hours)</td>'
+               '<td>%s</td>'
+               '<td>%s</td>'
+               '<td>%s</td>'
+               '<td>%s</td>'
+               '</tr>'
+          % (entryRow['entry_name'],
+             insertWBR(entryRow['entry_name']),
+             insertWBR(entryRow['gatekeeper']),
+             int(entryRow["max_rss_bytes"] / 1048576),
+               entryRow['max_processors'],
+               int(entryRow["max_rss_bytes"] / 
+                   (1048576 * entryRow['max_processors'])),
+             entryRow['max_wall_seconds'],
+               int(entryRow["max_wall_seconds"] / 3600),
+             'TRUE' if entryRow['entry_has_gpus'] else 'False',
+             lastGetStageStr,
+             entryRow['osg_date'],
+             '' if (entryRow['always_inner_apptainer'] == 1) 
+                else bool(entryRow['always_inner_apptainer'])
             )
          )    
 
@@ -2691,7 +4203,7 @@ def showSite(environ, user, cgiValues):
 
   output += ("<h1>Site %s</h1>" % siteName)
   
-  query = ('SELECT sites.site_id,DATE(last_osg_seen_time) AS osg_date,'
+  query = ('SELECT sites.site_id,last_osg_seen_time,'
            'last_get_jobscript_time,'
            'site_name,jobsub_site_name,wlcg_site_name,'
            'sites.enabled,'
@@ -2700,8 +4212,10 @@ def showSite(environ, user, cgiValues):
            'sites.last_submitted_time,'
            'sites.last_get_jobscript_time,'
            'sites.last_awt_time,'
+           'sites.last_awt_gpu_time,'
            'sites.max_rss_bytes,'
            'sites.max_processors,sites.max_wall_seconds,'
+           'only_production,only_on_request,'
            'wlcg_site_name,always_inner_apptainer,'
            'rank_text,cache_time '
            'FROM sites '
@@ -2726,7 +4240,7 @@ def showSite(environ, user, cgiValues):
              % siteRow['region'])
 
   output += ('<tr><td colspan="2">Seen in OSG config</td><td>%s</td></tr>'
-             % siteRow['osg_date'])
+             % siteRow['last_osg_seen_time'])
 
   output += ('<tr><td colspan="2">Enabled?</td><td>%s'
         % bool(siteRow['enabled']))
@@ -2743,8 +4257,14 @@ def showSite(environ, user, cgiValues):
 
   output += '</td></tr>' 
 
-  output += ('<tr><td colspan="2">Last submitted</td><td>%s</td></tr>' 
-        % siteRow['last_submitted_time'])
+  output += ('<tr><td colspan="2">Only production?</td><td>%s</td></tr>\n'
+        % bool(siteRow['only_production']))
+
+  output += ('<tr><td colspan="2">Only on request?</td><td>%s</td></tr>\n'
+        % bool(siteRow['only_on_request']))
+
+#  output += ('<tr><td colspan="2">Last AWT submitted</td><td>%s</td></tr>' 
+#        % siteRow['last_submitted_time'])
 
   if str(siteRow['last_get_jobscript_time']) == justin.unixEpoch:
     lastGetJobscriptStr = '&nbsp;'
@@ -2754,7 +4274,11 @@ def showSite(environ, user, cgiValues):
   output += ('<tr><td colspan="2">Last job started</td><td>%s</td></tr>' 
              % lastGetJobscriptStr)
 
-  output += ('<tr><td colspan="2">Last AWT job</td><td>%s</td></tr>' % spaceForUnixEpoch(siteRow['last_awt_time']))
+  output += ('<tr><td colspan="2">Last AWT job ran</td><td>%s</td></tr>' 
+             % spaceForUnixEpoch(siteRow['last_awt_time']))
+
+  output += ('<tr><td colspan="2">Last AWT GPU job ran</td><td>%s</td></tr>' 
+             % spaceForUnixEpoch(siteRow['last_awt_gpu_time']))
 
   output += ('<tr><td colspan="2">Always has inner apptainer</td>'
              '<td>%s</td></tr>' % 
@@ -2805,7 +4329,7 @@ def showSite(environ, user, cgiValues):
 
   query = ('SELECT entry_name,gatekeeper,max_processors,max_rss_bytes,'
            'max_wall_seconds,always_inner_apptainer,'
-           'DATE(last_osg_seen_time) AS osg_date '
+           'DATE(last_osg_seen_time) AS osg_date,entry_has_gpus '
            'FROM entries '
            'WHERE entries.site_id=%d '
            'ORDER BY entry_name' % siteRow['site_id'])
@@ -2817,18 +4341,21 @@ def showSite(environ, user, cgiValues):
   output += ('<tr>'
         '<th>Entry</th>'
         '<th>Gatekeeper</th>'
-        '<th>RSS (MB) / processors</th>'
+        '<th>RSS (MiB) / processors</th>'
         '<th>Wall seconds limit</th>'
         '<th>Always has inner apptainer</th>'
+        '<th>GPUs</th>'
         '<th>Seen in OSG config</th>'
         '</tr>')
   
   for entryRow in entryRows:  
     output += ('<tr>'
-          '<td><a href="http://gfactory-2.opensciencegrid.org/factory/monitor/factoryEntryStatusNow.html?entry=%s">%s</a></td>'
+          '<td><a href="/dashboard/?method=show-entry&entry_name=%s">'
+          '%s</a></td>'
           '<td>%s</td>'
           '<td>%d / %d = %d</td>'
           '<td>%d (%d hours)</td>'
+          '<td>%s</td>'
           '<td>%s</td>'
           '<td>%s</td>'
           '</tr>\n'
@@ -2842,6 +4369,7 @@ def showSite(environ, user, cgiValues):
                int(entryRow["max_wall_seconds"] / 3600),
              ('' if (entryRow['always_inner_apptainer'] == 1) 
                  else bool(entryRow['always_inner_apptainer'])),
+             str(bool(entryRow['entry_has_gpus'])),
              entryRow['osg_date']
             )
          )    
@@ -2922,6 +4450,139 @@ def showSite(environ, user, cgiValues):
   output += footer()
   return output
 
+def showEntry(environ, user, cgiValues):
+      
+  try:
+    entryName = cgiValues["entry_name"]
+  except:
+    return errorPage(environ, user, "entry_name must be given")
+    
+  if not justin.stringIsSite(entryName):
+    return errorPage(environ, user, "Invalid entry name!")
+        
+  output = header(environ, user, "justIN: Entry " + entryName)
+
+  output += ("<h1>Entry %s</h1>" % entryName)
+  
+  query = ('SELECT DATE(entries.last_osg_seen_time) AS osg_date,'
+           'entries.last_get_jobscript_time,'
+           'site_name,jobsub_site_name,wlcg_site_name,'
+           'sites.enabled,'
+           'sites.country,'
+           'sites.region,'
+           'sites.last_submitted_time,'
+           'sites.last_get_jobscript_time,'
+           'entries.gatekeeper,'
+           'entries.last_awt_time,'
+           'entries.max_rss_bytes,'
+           'entries.max_processors,entries.max_wall_seconds,'
+           'wlcg_site_name,entries.always_inner_apptainer,'
+           'entries.entry_has_gpus,'
+           'entries.file_name,entries.raw_config '
+           'FROM entries '
+           'LEFT JOIN sites '
+           'ON sites.site_id=entries.site_id '
+           'WHERE entry_name="%s"' % entryName)
+
+  entryRow = justin.select(query, justOne = True)
+
+  output += ('<table>')
+  
+  output += ('<tr><td>Entry</td><td>%s</td></tr>' 
+             % entryName)
+
+  output += ('<tr><td>Site</td><td>'
+             '<a href="/dashboard/?method=show-site&site_name=%s">%s</a> '
+             '(%s)</td></tr>' 
+             % (entryRow['site_name'], entryRow['site_name'], 
+                'enabled' if entryRow['enabled'] else 'not enabled'))
+  
+  output += ('<tr><td>Gatekeeper</td><td>%s</td></tr>' 
+             % entryRow['gatekeeper'])
+  
+  output += ('<tr><td>RSS (MiB) / processors</td><td>%d / %d = %d</td></tr>'
+             % (int(entryRow["max_rss_bytes"] / 1048576),
+                entryRow['max_processors'],
+                int(entryRow["max_rss_bytes"] / 
+                    (1048576 * entryRow['max_processors'])
+                   )
+               )
+            )
+
+  output += ('<tr><td>Wall seconds limit</td><td>%d (%d hours)</td></tr>'
+             % (entryRow['max_wall_seconds'],
+                int(entryRow["max_wall_seconds"] / 3600)
+               )
+            )
+
+  output += ('<tr><td>Seen in OSG config</td><td>%s</td></tr>'
+             % entryRow['osg_date'])
+
+#  output += ('<tr><td>Last AWT submitted</td><td>%s</td></tr>' 
+#             % entryRow['last_submitted_time'])
+
+  if str(entryRow['last_get_jobscript_time']) == justin.unixEpoch:
+    lastGetJobscriptStr = '&nbsp;'
+  else:
+    lastGetJobscriptStr = str(entryRow['last_get_jobscript_time'])
+
+  output += ('<tr><td>Last job started</td><td>%s</td></tr>' 
+             % lastGetJobscriptStr)
+
+  output += ('<tr><td>Last AWT job</td><td>%s</td></tr>' 
+             % spaceForUnixEpoch(entryRow['last_awt_time']))
+
+  output += ('<tr><td>Always has inner apptainer</td>'
+             '<td>%s</td></tr>' % 
+             ('' if (entryRow['always_inner_apptainer'] == 1)
+                 else bool(entryRow['always_inner_apptainer'])))
+
+  output += ('<tr><td>Has GPUs</td><td>%s</td></tr>' 
+             % str(bool(entryRow['entry_has_gpus'])))
+
+  output += ('<tr><td>Jobs</td><td>'
+             '<a href="/dashboard/?method=list-jobs&entry_name=%s">All</a> ' 
+             % entryName)
+
+  for state in ['submitted', 'started', 'processing', 'outputting',
+                'finished', 'notused', 'aborted', 'stalled', 
+                'jobscript_error', 'outputting_failed']:
+    output += ('<a href="/dashboard/?method=list-jobs&job_state=%s&'
+               'entry_name=%s">%s</a> ' 
+               % (state, entryName, state.capitalize()))
+
+  output += ('<a href="/dashboard/?method=list-jobs&workflow_id=%d'
+             '&stage_id=1&entry_name=%s">AWT</a></td></tr>'
+             % (justin.awtWorkflowID, entryName))
+  
+  output += ('<tr><td>Events</td>'
+             '<td><a href="/dashboard/?method=list-events&entry_name=%s'
+             '">All</a> &nbsp; ' % entryName)
+
+  output += ('<a href="/dashboard/?method=list-events&entry_name=%s&'
+             'awt_events=True">AWT</a></td></tr>' % entryName)
+
+  output += ('<tr><td>Pilot factory status page</td>'
+             '<td><a href="http://gfactory-2.opensciencegrid.org/factory/monitor/factoryEntryStatusNow.html?entry=%s">%s</a></td></tr>'
+             % (entryName, entryName))
+         
+  output += ("</table>")
+
+  output += ('<p>Raw configuration ')
+
+  if entryRow['file_name']:
+    output += ('from '
+               '<a href="https://github.com/opensciencegrid/osg-gfactory/blob/'
+               'master/%s">opensciencegrid/osg-gfactory/%s</a>'
+               % (entryRow['file_name'], entryRow['file_name']))
+
+  output += ('<pre style="white-space: pre-wrap;">') 
+  output += html.escape(entryRow["raw_config"], quote=True)  
+  output += ('</pre>') 
+
+  output += footer()
+  return output
+
 def showUser(environ, user, cgiValues):
       
   try:
@@ -2942,9 +4603,10 @@ def showUser(environ, user, cgiValues):
     justinSession = ' '
   
   query = ('SELECT users.user_id,principal_name,created_time,expires_time,'
-           'access_token_created,access_token_expires,'
+           'access_token_created,access_token_expires,access_token,'
            'LENGTH(access_token) AS access_token_len,'
-           'LENGTH(refresh_token) AS refresh_token_len '
+           'LENGTH(refresh_token) AS refresh_token_len,'
+           'users.processing_enabled '
            'FROM principal_names '
            'LEFT JOIN users '
            'ON principal_names.pn_id=users.main_pn_id '
@@ -2959,7 +4621,9 @@ def showUser(environ, user, cgiValues):
   except:
     return errorPage(environ, user, "Unknown user!")
 
-  if user and user['user_name'] == userName:
+  # Things we only show to the user themself
+  if user and \
+   (user['user_name'] == userName or user['user_name'] in justin.justinAdmins):
     output += ('<h2>Your current session</h2>\n')
 
     if user['user_name'] in justin.justinAdmins:
@@ -2968,8 +4632,33 @@ def showUser(environ, user, cgiValues):
     output += ('<table><tr><td>User name</td><td>%s</td></tr>' 
                % userName)
 
+    if user and user['user_name'] in justin.justinAdmins:
+      processingButtonHTML = ' ' + buttonHTML(user = user,
+                    nextURI = '/dashboard/?method=show-user&user_name=%s'
+                                    % userName,
+                    label   = ('Disable' if bool(userRow['processing_enabled']) 
+                               else 'Enable'),
+                    key     = userRow['user_id'],
+                    name    = 'set_user_processing_state', 
+                    value   = not bool(userRow['processing_enabled']))
+    else:
+      processingButtonHTML = ''
+
+    output += ('<tr><td>Processing enabled?</td><td>%s%s</td></tr>' 
+               % ('Enabled' if userRow['processing_enabled'] else 'Disabled',
+                  processingButtonHTML))
+
     output += ('<tr><td>Groups</td><td>%s</td></tr>' 
                % ' &nbsp; '.join(user['wlcg_groups']))
+
+    output += '<tr><td>Quotas</td><td>' 
+
+    for i in user['named_quotas']:
+      output += \
+  ('<a href="/dashboard/?method=show-quota&quota_name=%s">%s</a> &nbsp; ' 
+  % (i, i))
+
+    output += '</td></tr>' 
 
     output += ('<tr><td>Valid</td><td>%s to %s UTC</td></tr>' 
                % (userRow['created_time'], userRow['expires_time']))
@@ -2979,11 +4668,22 @@ def showUser(environ, user, cgiValues):
     if userRow['access_token_len'] > 0:
       output += ('<h2>Your access token</h2>\n<table>')
   
+      output += ('<tr><td>Scopes requested</td><td>%s</td></tr>' 
+               % justin.cilogonScopes)
+
       output += ('<tr><td>Created</td><td>%s UTC</td></tr>' 
                % userRow['access_token_created'])
 
       output += ('<tr><td>Expires</td><td>%s UTC</td></tr>' 
                % userRow['access_token_expires'])
+
+      accessTokenDict = json.loads(base64.urlsafe_b64decode(
+                            userRow['access_token'].split('.')[1] + '=='))
+
+      for k in accessTokenDict:
+        output += ('<tr><td>%s</td><td>%s</td></tr>' %
+                   (k, insertWBR(str(accessTokenDict[k])).replace(' ','<br>'))
+                  )
 
       if userRow['refresh_token_len'] == 0:
         output += '<tr><td colspan="2">No refresh token!</td></tr>'
@@ -3152,6 +4852,82 @@ def showStorage(environ, user, cgiValues):
 
   output += ("</table>")
 
+  output += '<h2>Quotas and usage</h2>\n<table>\n'
+
+  output += '<tr><th>Quota name</th><th>Usage</th><th>Quota</th><th>Occupancy</th></tr>'
+
+  query = ('SELECT quota_name,bytes,bytes_limit FROM storages_quotas '
+           'LEFT JOIN named_quotas '
+           'ON storages_quotas.quota_id=named_quotas.quota_id '
+           'WHERE rse_id=%d '
+           'ORDER BY bytes_limit=18446744073709551615,quota_name' 
+           % storageRow['rse_id'])
+
+  totalBytes   = 0
+  totalLimit   = 0
+  subTotalPrinted = False
+  quotaRows    = justin.select(query)
+  
+  for quotaRow in quotaRows:
+
+    if not subTotalPrinted and quotaRow['bytes_limit'] == 18446744073709551615:
+
+      if totalLimit == 0:
+        occ = ' '
+      else:
+        occ = '%.1f%%' % ((100.0 * totalBytes) / totalLimit)
+
+      subTotalPrinted = True
+      output += ('<tr><td><b>Sub total</b></td><td><b>%s</b></td>'
+                 '<td><b>%s</b></td><td><b>%s</b></td></tr>' 
+                 % (justin.bytesToUnits(totalBytes),
+                    justin.bytesToUnits(totalLimit),
+                    occ
+                   )
+                )
+
+    totalBytes += quotaRow['bytes']
+    totalLimit += quotaRow['bytes_limit']
+
+    if quotaRow['bytes_limit'] == 0:
+      bytesLimit = '0'
+      occ = ' '
+    elif  quotaRow['bytes_limit'] == 18446744073709551615:
+      bytesLimit = ' '
+      occ = ' '
+    else:
+      bytesLimit = justin.bytesToUnits(quotaRow['bytes_limit'])
+      occ = ('%.1f%%' 
+             % ((100.0 * quotaRow['bytes']) / quotaRow['bytes_limit']))
+
+    output += ('<tr><td><a href="/dashboard/?method=show-quota&quota_name=%s">'
+               '%s</a></td><td>%s</td><td>%s</td><td>%s</td></tr>' % 
+               (quotaRow['quota_name'], quotaRow['quota_name'], 
+                justin.bytesToUnits(quotaRow['bytes']), 
+                bytesLimit,
+                occ                
+               )
+              )
+
+  if subTotalPrinted:
+    output += ('<tr><td><b>Total<b></td><td colspan="3"><b>%s</b></td></tr>' 
+                 % justin.bytesToUnits(totalBytes))
+  else:
+    if totalLimit == 0:
+      occ = ' '
+    else:
+      occ = '%.1f%%' % ((100.0 * totalBytes) / totalLimit)
+
+    output += ('<tr><td><b>Total</b></td><td><b>%s</b></td>'
+               '<td><b>%s</b></td><td><b>%s</b></td></tr>' 
+                 % (justin.bytesToUnits(totalBytes),
+                    justin.bytesToUnits(totalLimit),
+                    occ
+                   )
+              )
+
+  output += '</table>'
+
   output += footer()
   return output
 
@@ -3163,7 +4939,7 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
   try:
     workflowID = int(cgiValues["workflow_id"])
   except:
-    pass
+    workflowID = ''
   else:
     if workflowID:
       whereList.append('events.workflow_id=%d' % workflowID)
@@ -3172,7 +4948,7 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
   try:
     stageID = int(cgiValues["stage_id"])
   except:
-    pass
+    stageID = ''
   else:
     if stageID:
       whereList.append('events.stage_id=%d' % stageID)
@@ -3180,17 +4956,32 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
 
   try:
     jobsubID = cgiValues["jobsub_id"]
+
+    if not justin.stringIsJobsubID(jobsubID):
+      raise
   except:
-    pass
+    jobsubID = ''
   else:
     if jobsubID:
       whereList.append('jobsub_id="%s"' % jobsubID)
       queryList += '&jobsub_id=' + jobsubID
 
   try:
-    fileDID = cgiValues["file_did"]
+    jobscriptExit = int(cgiValues["jobscript_exit"])
   except:
-    pass
+    jobscriptExit = ''
+  else:
+    if jobscriptExit != '':
+      whereList.append('events.jobscript_exit=%d' % jobscriptExit)
+      queryList += '&jobscript_exit=' + str(jobscriptExit)
+
+  try:
+    fileDID = cgiValues["file_did"]
+
+    if not justin.stringIsDID(fileDID):
+      raise
+  except:
+    fileDID = ''
   else:
     if fileDID:
       whereList.append('file_did="%s"' % fileDID)
@@ -3198,8 +4989,11 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
 
   try:
     rseName = cgiValues["rse_name"]
+
+    if not justin.stringIsSite(rseName):
+      raise
   except:
-    pass
+    rseName = ''
   else:
     if rseName:
       whereList.append('rse_name="%s"' % rseName)
@@ -3207,20 +5001,47 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
 
   try:
     siteName = cgiValues["site_name"]
+
+    if not justin.stringIsSite(siteName):
+      raise
   except:
-    pass
+    siteName = ''
   else:
     if siteName:
       whereList.append('site_name="%s"' % siteName)
       queryList += '&site_name=' + siteName
 
   try:
+    entryName = cgiValues["entry_name"]
+
+    if not justin.stringIsSite(entryName):
+      raise
+  except:
+    entryName = ''
+  else:
+    if entryName:
+      whereList.append('entry_name="%s"' % entryName)
+      queryList += '&entry_name=' + entryName
+
+  try:
+    eventTypeName = cgiValues["event_type_name"]
+
+    if not justin.stringIsSite(eventTypeName):
+      raise
+  except:
+    eventTypeName = ''
+  else:
+    if eventTypeName:
+      whereList.append('event_type_name="%s"' % eventTypeName)
+      queryList += '&event_type_name=' + eventTypeName
+
+  try:
     awtEvents = bool(cgiValues["awt_events"])
   except:
-    pass
+    awtEvents = ''
   else:
     if awtEvents:
-      whereList.append('event_type_id IN (%d,%d,%d,%d)' 
+      whereList.append('events.event_type_id IN (%d,%d,%d,%d)' 
                        % (justin.event_AWT_READ_OK,
                           justin.event_AWT_READ_FAIL,
                           justin.event_AWT_WRITE_OK,
@@ -3231,24 +5052,115 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
     whereString = ' WHERE ' + ' AND '.join(whereList)
   else:
     whereString = ''
-    
+
+  # These lists are used for the pull down menus in the filter HTML
+  eventTypeRows = justin.select('SELECT event_type_name FROM event_types '
+                                'ORDER BY event_type_name')
+  siteRows      = justin.select('SELECT site_name FROM sites '
+                                'ORDER BY site_name')
+  entryRows     = justin.select('SELECT entry_name FROM entries '
+                                'ORDER BY entry_name')
+  rseRows       = justin.select('SELECT rse_name FROM storages '
+                                'ORDER BY rse_name')
+
   output = header(environ, user, "justIN: Events")
 
-  output += ("<h1>Events</h1>")
+  output += ("<h1>Events</h1>\n")
+
+  output += ("<!-- %s -->\n" % str(cgiValues))
+
+  output += ('<p><form method="get" formaction="/dashboard/">'
+    '<input type="hidden" name="method" value="list-events">'
+    '<label>Event&nbsp;Type:<select name="event_type_name">'
+    '<option value=""%s>ANY</option>'
+    % ('' if eventTypeName else ' selected'))
+
+  for eventTypeRow in eventTypeRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (eventTypeRow['event_type_name'],
+                  ' selected' 
+                  if eventTypeRow['event_type_name'] == eventTypeName
+                  else '',
+                  eventTypeRow['event_type_name']))
+                    
+  output += ('</select></label> '
+    '<label>Workflow&nbsp;ID:<input type="number" name="workflow_id" '
+    'min="1" max="99999" step="1" value="%s"></label> '
+    '<label>Stage&nbsp;ID:<input type="number" name="stage_id" min="1" '
+    'max="9" step="1" value="%s"></label> '
+    '<label>File&nbsp;DID:<input type="text" name="file_did" '
+    'value="%s"></label> '
+    '<label>Jobsub&nbsp;ID:<input type="text" name="jobsub_id" '
+    'value="%s" size="50"></label> '
+    '<label>Jobscript&nbsp;exit:<input type="number" name="jobscript_exit" '
+    'min="0" max="255" step="1" value="%s"></label> '
+    '<label>Site:<select name="site_name">'
+    '<option value=""%s>ANY</option>'
+    % (str(workflowID), str(stageID), fileDID, jobsubID, str(jobscriptExit),
+       '' if siteName else ' selected'))
+
+  for siteRow in siteRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (siteRow['site_name'],
+                  ' selected' 
+                  if siteRow['site_name'] == siteName
+                  else '',
+                  siteRow['site_name']))
   
-  query = ('SELECT event_id,event_type_id,events.workflow_id,events.stage_id,'
-           'file_did,jobsub_id,site_name,rse_name,event_time '
+  output += ('</select></label> '
+    '<label>Entry:<select name="entry_name">'
+    '<option value=""%s>ANY</option>'
+    % ('' if entryName else ' selected'))
+  
+  for entryRow in entryRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (entryRow['entry_name'],
+                  ' selected' 
+                  if entryRow['entry_name'] == entryName
+                  else '',
+                  entryRow['entry_name']))
+  
+  output += ('</select></label> '
+    '<label>RSE:<select name="rse_name">'
+    '<option value=""%s>ANY</option>'
+    % ('' if rseName else ' selected'))
+  
+  for rseRow in rseRows:
+    output += ('<option value="%s"%s>%s</option>' 
+               % (rseRow['rse_name'],
+                  ' selected' 
+                  if rseRow['rse_name'] == rseName
+                  else '',
+                  rseRow['rse_name']))
+  
+  output += ('</select></label> '
+    '<input type="submit" value="Filter" '
+    'style="background: #E1703D; border-radius: 5px; padding: 5px; '
+    'color: white; font-weight: bold; font-size: 1em; border: 0; '
+    'cursor: pointer">'
+    '</form></p>\n')
+   
+  query = ('SELECT event_id,events.event_type_id,event_type_name,event_text,'
+           'events.workflow_id,events.stage_id,'
+           'file_did,jobsub_id,site_name,entry_name,rse_name,event_time,'
+           'events.jobscript_exit '
            'FROM events '
+           'LEFT JOIN event_types '
+           'ON events.event_type_id=event_types.event_type_id '
            'LEFT JOIN files ON events.file_id=files.file_id '
+           'AND events.workflow_id=files.workflow_id '
+           'AND events.stage_id=files.stage_id '
            'LEFT JOIN jobs ON events.justin_job_id=jobs.justin_job_id '
+           'AND events.workflow_id=jobs.workflow_id '
+           'AND events.stage_id=jobs.stage_id '
            'LEFT JOIN sites ON events.site_id=sites.site_id '
+           'LEFT JOIN entries ON events.entry_id=entries.entry_id '
            'LEFT JOIN storages ON events.rse_id=storages.rse_id '
            '%s '
            'ORDER BY event_id DESC LIMIT %d,%d' % 
            (whereString, pageNumber * pageLength, pageLength + 1))
 
-  justin.cur.execute(query)
-  eventsRows = justin.cur.fetchall()
+  eventsRows = justin.select(query)
 
   output += makePager(pageNumber, pageLength, len(eventsRows),
              '/dashboard/?method=list-events&page_number=%d&page_length=%d'
@@ -3261,20 +5173,26 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
 <th>Workflow</th><th>Stage</th>
 <th>File DID</th>
 <th>Jobsub ID</th>
-<th>Site</th>
+<th>Site / Entry</th>
 <th>RSE</th>
 </tr>""")
 
   for eventRow in eventsRows[:pageLength]:
-    eventType = justin.eventTypes[eventRow['event_type_id']][0]
-    cellColor = '#FFDDDD' if ('FAIL' in eventType) else \
-                ('#DDFFDD' if 'OK' in eventType else 'white')
+    cellColor = '#FFDDDD' if ('FAIL' in eventRow['event_type_name']) else \
+                ('#DDFFDD' if 'OK' in eventRow['event_type_name'] else 'white')
 
-    output += ('<tr><td>%d</td><td style="background-color: %s">%s</td>'
+    if eventRow['event_type_id'] in \
+        (justin.event_JOB_SCRIPT_ERROR, justin.event_JOB_ABORT_SCRIPT_ERROR):
+      nameSuffix = ' (%d)' % eventRow['jobscript_exit']
+    else:
+      nameSuffix = ''
+
+    output += ('<tr><td>%d</td><td style="background-color: %s">%s%s</td>'
                '<td>%s</td>' %
                (eventRow['event_id'], 
                 cellColor,
-                eventType,
+                eventRow['event_type_name'],
+                nameSuffix,
                 eventRow['event_time']
                )          
               )
@@ -3303,7 +5221,7 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
             '&file_did=%s">%s</td>' 
             % (eventRow['workflow_id'], 
                eventRow['file_did'], 
-               eventRow['file_did']))
+               insertWBR(eventRow['file_did'])))
     else:
       output += ('<td>&nbsp;</td>')
          
@@ -3314,8 +5232,15 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
       output += ('<td>&nbsp;</td>')
          
     if eventRow['site_name']: 
-      output += ('<td><a href="/dashboard/?method=show-site&site_name=%s">%s</a></td>'
-            % (eventRow['site_name'], eventRow['site_name']))
+      output += \
+       ('<td><a href="/dashboard/?method=show-site&site_name=%s">%s</a>%s</td>'
+            % (eventRow['site_name'], eventRow['site_name'], 
+               ('<br><a href="/dashboard/?method=show-entry&entry_name=%s">'
+                '%s</a>' 
+                % (eventRow['entry_name'], eventRow['entry_name'])
+               ) if eventRow['entry_name'] else ''
+              )
+       )
     else:
       output += ('<td>&nbsp;</td>')
          
@@ -3333,20 +5258,89 @@ def listEvents(environ, user, cgiValues, pageNumber, pageLength):
              '/dashboard/?method=list-events&page_number=%d&page_length=%d'
              + queryList)
 
+  output += ('<p>You can download this list as '
+               '<a href="/dashboard/?method=download-events%s'
+               '&format=csv&csvfile=">CSV</a> or '
+               '<a href="/dashboard/?method=download-events%s'
+               '&format=json">JSON</a> '
+               '(up to %d files included)</p>'
+               % (queryList,
+                  queryList,
+                  csvJsonMaxRows))
+
   output += footer()
   return output
 
 def downloadCsvJson(environ, user, cgiValues, method):
 
+  # Set up and validate all possible options
   try:
     workflowID = int(cgiValues["workflow_id"])
   except:
-    return errorPage(environ, user, "workflow_id must be given")
-  
+    workflowID = None
+
   try:
     stageID = int(cgiValues["stage_id"])
   except:
-    return errorPage(environ, user, "stage_id must be given")
+    stageID = None
+
+  try:
+    campaignID = int(cgiValues["campaign_id"])
+  except:
+    campaignID = None
+
+  try:
+    jobsubID = cgiValues["jobsub_id"]
+
+    if not justin.stringIsJobsubID(jobsubID):
+      raise
+  except:
+    jobsubID = None
+
+  try:
+    jobscriptExit = int(cgiValues["jobscript_exit"])
+  except:
+    jobscriptExit = None
+
+  try:
+    fileDID = cgiValues["file_did"]
+
+    if not justin.stringIsDID(fileDID):
+      raise
+  except:
+    fileDID = None
+
+  try:
+    rseName = cgiValues["rse_name"]
+
+    if not justin.stringIsSite(rseName):
+      raise
+  except:
+    rseName = None
+
+  try:
+    siteName = cgiValues["site_name"]
+
+    if not justin.stringIsSite(siteName):
+      raise
+  except:
+    siteName = None
+
+  try:
+    entryName = cgiValues["entry_name"]
+
+    if not justin.stringIsSite(entryName):
+      raise
+  except:
+    entryName = None
+
+  try:
+    eventTypeName = cgiValues["event_type_name"]
+
+    if not justin.stringIsSite(eventTypeName):
+      raise
+  except:
+    eventTypeName = None
 
   if 'format' in cgiValues:
     format = cgiValues['format']
@@ -3357,6 +5351,10 @@ def downloadCsvJson(environ, user, cgiValues, method):
     return errorPage(environ, user, "format must be csv or json")
 
   if method == 'download-file-states':
+
+    if workflowID is None or stageID is None:
+      return errorPage(environ, user, "workflow_id and stage_id must be given")
+
     # CSV or JSON file with states of input files for a workflow/stage
     stateFilter = ''
     stateText = ''
@@ -3378,17 +5376,17 @@ def downloadCsvJson(environ, user, cgiValues, method):
     query = ("SELECT files.file_did,files.state,"
              "CAST(event_time AS CHAR) AS last_allocation_time,"
              "storages.rse_name,jobs.jobsub_id,"
-             "sites.site_name,"
-             "allocations,jobs.jobscript_exit AS last_jobscript_exit "
+             "sites.site_name,allocations,max_allocations,"
+             "jobs.jobscript_exit AS last_jobscript_exit "
              "FROM files "
              "LEFT JOIN events"
              " ON files.justin_job_id=events.justin_job_id AND"
-             " events.event_type_id=%d "
+             " events.event_type_id=%d AND files.file_id=events.file_id "
              "LEFT JOIN storages ON events.rse_id=storages.rse_id "
              "LEFT JOIN jobs ON jobs.justin_job_id=files.justin_job_id "
              "LEFT JOIN sites ON jobs.site_id=sites.site_id "
              "WHERE files.workflow_id=%d AND files.stage_id=%d %s "
-             "ORDER BY files.file_id DESC LIMIT %d" % 
+             "ORDER BY files.file_id LIMIT %d" % 
              (justin.event_FILE_ALLOCATED, workflowID, stageID, stateFilter,
               csvJsonMaxRows))
  
@@ -3397,6 +5395,9 @@ def downloadCsvJson(environ, user, cgiValues, method):
 
   elif method == 'download-input-file-stats':
     # CSV or JSON file with stats of input files for a workflow/stage
+
+    if workflowID is None or stageID is None:
+      return errorPage(environ, user, "workflow_id and stage_id must be given")
 
     query = ('SELECT file_did,jobsub_id,site_name,rse_name,size_bytes,'
              'jobscript_real_seconds AS seconds,distance,'
@@ -3413,14 +5414,19 @@ def downloadCsvJson(environ, user, cgiValues, method):
              'LEFT JOIN sites ON events.site_id=sites.site_id '
              'WHERE files.state="processed" '
              'AND files.workflow_id=%d '
-             'AND files.stage_id=%d' %
-             (justin.event_FILE_ALLOCATED, workflowID, stageID))
+             'AND files.stage_id=%d '
+             'ORDER BY files.file_id LIMIT %d' %
+             (justin.event_FILE_ALLOCATED, workflowID, stageID, 
+              csvJsonMaxRows))
 
     fieldsList = ['file_did','jobsub_id','site_name','rse_name','size_bytes',
                   'seconds','distance','job_finish_time']
 
   elif method == 'download-output-file-stats':
     # CSV or JSON file with stats of output files for a workflow/stage
+
+    if workflowID is None or stageID is None:
+      return errorPage(environ, user, "workflow_id and stage_id must be given")
 
     query = ('SELECT file_did,jobsub_id,site_name,rse_name,size_bytes,'
              'seconds,distance,CAST(event_time AS CHAR) AS job_finish_time '
@@ -3434,12 +5440,104 @@ def downloadCsvJson(environ, user, cgiValues, method):
              'LEFT JOIN sites ON events.site_id=sites.site_id '
              'WHERE event_type_id=%d '
              'AND events.workflow_id=%d '
-             'AND events.stage_id=%d' %
-             (justin.event_FILE_CREATED, workflowID, stageID))
+             'AND events.stage_id=%d '
+             'ORDER BY files.file_id LIMIT %d' %
+             (justin.event_FILE_CREATED, workflowID, stageID, csvJsonMaxRows))
 
     fieldsList = ['file_did','jobsub_id','site_name','rse_name','size_bytes',
                   'seconds','distance','job_finish_time']
 
+  elif method == 'download-events':
+    # CSV or JSON file with stats of events
+
+    whereList = []
+     
+    if workflowID is not None:
+      whereList.append('events.workflow_id=%d' % workflowID)
+
+    if stageID is not None:
+      whereList.append('events.stage_id=%d' % stageID)
+
+    if jobsubID is not None:
+      whereList.append('jobsub_id="%s"' % jobsubID)
+
+    if jobscriptExit is not None:
+      whereList.append('events.jobscript_exit=%d' % jobscriptExit)
+
+    if fileDID is not None:
+      whereList.append('file_did="%s"' % fileDID)
+
+    if rseName is not None:
+      whereList.append('rse_name="%s"' % rseName)
+
+    if siteName is not None:
+      whereList.append('site_name="%s"' % siteName)
+
+    if entryName is not None:
+      whereList.append('entry_name="%s"' % entryName)
+
+    if eventTypeName is not None:
+      whereList.append('event_type_name="%s"' % eventTypeName)
+
+    if whereList:
+      whereString = ' WHERE ' + ' AND '.join(whereList)
+    else:
+      whereString = ''
+
+    query = ('SELECT event_id,event_type_name,'
+             'events.workflow_id,events.stage_id,'
+             'file_did,jobsub_id,site_name,entry_name,rse_name,'
+             'CAST(event_time AS CHAR) AS event_time,'
+             'events.jobscript_exit '
+             'FROM events '
+           'LEFT JOIN event_types '
+           'ON events.event_type_id=event_types.event_type_id '
+           'LEFT JOIN files ON events.file_id=files.file_id '
+           'LEFT JOIN jobs ON events.justin_job_id=jobs.justin_job_id '
+           'LEFT JOIN sites ON events.site_id=sites.site_id '
+           'LEFT JOIN entries ON events.entry_id=entries.entry_id '
+           'LEFT JOIN storages ON events.rse_id=storages.rse_id '
+           '%s '
+           'ORDER BY event_id LIMIT %d' % 
+           (whereString, csvJsonMaxRows))
+
+    fieldsList = ['event_id', 'event_time', 'event_type_name',
+                  'workflow_id', 'stage_id', 'jobsub_id',
+                  'site_name', 'entry_name', 'file_did', 'rse_name', 
+                  'jobscript_exit']
+ 
+  elif method == 'download-campaign-workflows':
+    # CSV or JSON file with stats of workflows within a campaign
+
+    if not campaignID:
+      return errorPage(environ, user, "campaign_id must be given")
+
+    query = ('SELECT workflow_id,description,principal_name AS user_name,'
+             'workflows.state,mql,'
+             'CAST(started AS CHAR) AS start_time,'
+             'CAST(finished AS CHAR) AS finish_time,'
+             'scope_name,'
+             '(SELECT COUNT(*) FROM files'
+             ' WHERE files.workflow_id=workflows.workflow_id'
+             ' AND files.stage_id=1 '
+             ' AND files.state="processed") AS files_processed,'
+             '(SELECT COUNT(*) FROM files'
+             ' WHERE files.workflow_id=workflows.workflow_id'
+             ' AND files.stage_id=1) AS files_total '
+             'FROM workflows '
+             'LEFT JOIN users ON workflows.user_id=users.user_id '
+             'LEFT JOIN principal_names '
+             'ON principal_names.pn_id=users.main_pn_id '
+             'LEFT JOIN scopes ON workflows.scope_id=scopes.scope_id '
+             'LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id '
+             'WHERE campaign_id=%d '
+             'ORDER BY workflow_id DESC LIMIT %d' % 
+             (campaignID, csvJsonMaxRows))
+
+    fieldsList = ['workflow_id','description','user_name','state','mql',
+                  'start_time','finish_time','scope_name',
+                  'files_processed','files_total']
+ 
   else:  
     return errorPage(environ, user, "Download method not recognised!")
 
@@ -3454,8 +5552,10 @@ def downloadCsvJson(environ, user, cgiValues, method):
       outputFields = []
 
       for field in fieldsList:
-        if type(row[field]) is str:
-          outputFields.append('"' + row[field] + '"')
+        if row[field] is None:
+           outputFields.append('')
+        elif type(row[field]) is str:
+          outputFields.append('"' + row[field].replace('"','""') + '"')
         else:
           outputFields.append(str(row[field]))
 
@@ -3478,17 +5578,22 @@ def awtResults(environ, user, cgiValues):
 
   output += ("<h1>Automated Workflow Tests</h1>")
 
-  output += ('<p>Hover over each coloured box to see the most recent test '
-      'values for xrdcp read and rucio write, run in jobs at each site, '
-      'contacting each RSE.</p>'
-      '<p>Exit code 0 = success. Other codes are failure modes.</p>'
-      '<p>Green if read and write ok; orange if only read ok; red if '
+  output += ('<p>Hover over each coloured box to see the most recent storage test '
+      'values for xrdcp read and rucio upload, run in jobs at each site, '
+      'contacting each RSE. '
+      'Exit code 0 = success. Other codes are failure modes. '
+      'Green if read and write ok; orange if only read ok; red if '
       'read fails; grey if no result for %d hours. '
+      'For the GPU column, green indicates a successful AWT GPU job '
+      'in the last 48 hours and grey is no AWT GPU job ran within that time. '
       'There is a <a href="/docs/awt.md">full explanation of AWT</a> in the '
       'justIN documentation.</p>' % awtGreyHours)
 
   query = ('SELECT site_name,enabled,'
-           'UNIX_TIMESTAMP(last_awt_time) AS lwt,jobs.jobsub_id '
+           'UNIX_TIMESTAMP(last_awt_time) AS lwt,'
+           'UNIX_TIMESTAMP(last_awt_gpu_time) AS lwtgpu,'
+           'UNIX_TIMESTAMP(last_osg_seen_time) AS lot,'
+           'jobs.jobsub_id '
            'FROM sites '
            'LEFT JOIN jobs ON jobs.justin_job_id=sites.last_awt_job_id '
            'WHERE last_osg_seen_time > DATE_SUB(NOW(),INTERVAL %d DAY) '
@@ -3500,10 +5605,14 @@ def awtResults(environ, user, cgiValues):
   siteNames        = []
   enabledSiteNames = []
   lastJobTimes     = {}
+  lastGPUTimes     = {}
+  lastOSGTimes     = {}
   lastJobIDs       = {}
   for siteRow in sitesRows:
     siteNames.append(siteRow['site_name'])
     lastJobTimes[siteRow['site_name']] = int(siteRow['lwt'])
+    lastGPUTimes[siteRow['site_name']] = int(siteRow['lwtgpu'])
+    lastOSGTimes[siteRow['site_name']] = int(siteRow['lot'])
 
     if siteRow['jobsub_id']:
       lastJobIDs[siteRow['site_name']] = siteRow['jobsub_id']
@@ -3556,7 +5665,11 @@ def awtResults(environ, user, cgiValues):
   # List of storages
   output += ('<tr><td> </td>'
         '<td><div style="writing-mode: vertical-lr">'
-        'Last&nbsp;AWT&nbsp;job</div></td>')
+        'Last&nbsp;AWT&nbsp;job</div></td>'
+        '<td><div style="writing-mode: vertical-lr">'
+        'Last&nbsp;OSG&nbsp;time</div></td>'
+        '<td><div style="writing-mode: vertical-lr">'
+        'GPU&nbsp;AWT</div></td>')
   
   for rseName in rseNames:  
     if rseName in outputRseNames:
@@ -3569,7 +5682,7 @@ def awtResults(environ, user, cgiValues):
           '</div></%s>\n' % (cellType, rseName, 
                              rseName.replace('-','&#8209;'), cellType))
 
-  output += ('<td> </td></tr>\n')
+  output += ('<td> &nbsp; </td></tr>\n')
 
   # Go through the sites, Row by row 
 
@@ -3596,6 +5709,25 @@ def awtResults(environ, user, cgiValues):
       output += ('<td style="text-align: right">%s</td>' % 
             daysHoursMinutes(timeNow - lastJobTimes[siteName]))
   
+    output += '\n<!-- %d %d -->\n' % (timeNow, lastOSGTimes[siteName])
+    if lastOSGTimes[siteName] == 0:
+      output += ('<td> </td>')
+    else:
+      output += ('<td style="text-align: right">%s</td>' % 
+            daysHoursMinutes(timeNow - lastOSGTimes[siteName]))
+
+    lastGPUTimes[siteName] 
+
+    if lastGPUTimes[siteName] < timeNow - justin.unseenSitesExpireDays * 86400:
+      boxColor = 'white'
+    elif lastGPUTimes[siteName] < timeNow - 3600 * awtGreyHours:
+      boxColor = '#808080' # gray
+    else:
+      boxColor = '#80FF80' # green
+          
+    output += ('<td style="background-color: %s; width: 1em;">'
+               '&nbsp;</td>\n' % boxColor) 
+  
     for rseName in rseNames:
       (readResult, writeResult, jobsubID, finishedTime) = \
                       sitesStoragesMatrix[siteName][rseName]
@@ -3614,7 +5746,8 @@ def awtResults(environ, user, cgiValues):
         else:
           s += ' Write=%d' % writeResult
 
-        if finishedTime < timeNow - 3600 * awtGreyHours:
+        if finishedTime is None or \
+             (finishedTime < timeNow - 3600 * awtGreyHours):
           boxColor = '#BBBBBB'
         elif readResult == 255:
           boxColor = 'white'
@@ -3641,7 +5774,11 @@ def awtResults(environ, user, cgiValues):
   # List of storages
   output += ('<tr><td> </td>\n'
         '<td><div style="writing-mode: vertical-lr">'
-        'Last&nbsp;AWT&nbsp;job</div></td>')
+        'Last&nbsp;AWT&nbsp;job</div></td>'
+        '<td><div style="writing-mode: vertical-lr">'
+        'Last&nbsp;OSG&nbsp;time</div></td>'
+        '<td><div style="writing-mode: vertical-lr">'
+        'GPU&nbsp;AWT</div></td>')
   
   for rseName in rseNames:
     if rseName in outputRseNames:
@@ -3722,7 +5859,7 @@ def docsPage(startResponse, environ, user):
   for match in matches:
     processedText = re.sub(match, '', processedText)
 
-  output += markdown.markdown(processedText, extensions=['tables'])
+  output += markdown.markdown(processedText, extensions=['tables','toc'])
 
   output += '</div>\n'
   output += footer()
@@ -3751,8 +5888,51 @@ def setSiteStateHandler(cgiValues, user):
   else:
     return ('302 Moved', '')
 
+def setQuotaProcessingHandler(cgiValues, user):
 
-def setStorageStateHandler(cgiValues, user, readWrite):
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    quotaID   = int(cgiValues['action_key'])
+    newState = True if (cgiValues['action_value'] == 'True') else False
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  try:
+    justin.insertUpdate('UPDATE named_quotas '
+                        'SET processing_enabled=%s WHERE quota_id=%d' 
+                        % (newState, quotaID))
+    justin.conn.commit()
+  except:
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def setUserProcessingHandler(cgiValues, user):
+
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    userID   = int(cgiValues['action_key'])
+    newState = True if (cgiValues['action_value'] == 'True') else False
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  try:
+    justin.insertUpdate('UPDATE users '
+                        'SET processing_enabled=%s WHERE user_id=%d' 
+                        % (newState, userID))
+    justin.conn.commit()
+  except:
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def setStorageStateHandler(cgiValues, user):
 
   if user['user_name'] not in justin.justinAdmins:
     return ('403 Forbidden', 'You are not a justIN admin')
@@ -3765,9 +5945,11 @@ def setStorageStateHandler(cgiValues, user, readWrite):
 
   try:
     justin.insertUpdate('UPDATE storages SET justin_%s=%s WHERE rse_id=%d' 
-                        % ('read' if (readWrite == 'read') else 'write',
-                           newState, 
-                           rseID))
+             % ('read' 
+                if (cgiValues['action_name'] == 'set_storage_read_state') 
+                else 'write',
+                newState, 
+                rseID))
     justin.conn.commit()
   except:
     return ('500 Internal Server Error', 'Failed to update database')
@@ -3776,6 +5958,362 @@ def setStorageStateHandler(cgiValues, user, readWrite):
     return ('302 Moved', '')
 
 
+def setWorkflowStateHandler(cgiValues, user):
+  # stateChange is submit, restart, pause, or finish
+
+  try:
+    workflowID = int(cgiValues['action_key'])
+
+    workflowRow = justin.select('SELECT workflows.state,workflows.archived,'
+                    'workflows.user_id,wlcg_groups.wlcg_group_name '
+                    'FROM workflows '
+                    'LEFT JOIN scopes '
+                    'ON scopes.scope_id=workflows.scope_id '
+                    'LEFT JOIN named_quotas '
+                    'ON scopes.quota_id=named_quotas.quota_id '
+                    'LEFT JOIN wlcg_groups '
+                    'ON wlcg_groups.wlcg_group_id=named_quotas.wlcg_group_id '
+                    'WHERE workflow_id=%d' % workflowID, 
+                    justOne = True)
+  except:
+    return ('400 Bad Request', 'Invalid values sent')
+
+  # Check if this user can do this - should not arise as users are not offered
+  # actions they are not allowed to do but an important security check
+  allowed = False
+
+  if user['user_name'] in justin.justinAdmins:
+    # Admins have super powers
+    allowed = True
+  elif workflowRow['wlcg_group_name'] in user['wlcg_groups']:
+    # Anyone in the workflow's scope/quota's groups can change workflow states
+    allowed = True
+  elif cgiValues['action_name'] in ['workflow_pause', 'workflow_finish'] \
+       and user['user_id'] == workflowRow['user_id']:
+    # Even if scope's groups or group membership has changed you can
+    # always stop workflows submitted under your name
+    allowed = True
+
+  if not allowed:
+    return ('403 Forbidden', 'You do not have permission to do that!')
+
+  if cgiValues['action_name'] == 'workflow_submit':
+    if workflowRow['state'] == 'draft':
+      newState = 'submitted'
+    else:
+      return ('403 Forbidden', 'Only workflows in Draft can be submitted')
+
+  elif cgiValues['action_name'] == 'workflow_restart':
+    if workflowRow['state'] == 'paused':
+      newState = 'running'
+    else:
+      return ('403 Forbidden', 'Only workflows in Pause can be restarted')
+
+  elif cgiValues['action_name'] == 'workflow_pause':
+    if workflowRow['state'] == 'running':
+      newState = 'paused'
+    else:
+      return ('403 Forbidden', 'Only workflows in Running can be paused')
+
+  elif cgiValues['action_name'] == 'workflow_finish':
+    if workflowRow['state'] in ['running','submitted','draft']:
+      newState = 'finished'
+    else:
+      return ('403 Forbidden', 
+              'Only workflows in Running, Submitted, or Draft can be finished')
+  else:
+    return ('400 Bad Request', 'State change not recognised')
+
+  
+  try:
+    justin.insertUpdate('UPDATE workflows SET state="%s",'
+                        'state_message="Set to %s by %s" '
+                        'WHERE workflow_id=%d' 
+                        % (newState, newState, user['user_name'], workflowID))
+    justin.conn.commit()
+  except:
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    # Success - issue a 302 Moved response and the caller will set Location:
+    return ('302 Moved', '')
+
+def setQuotaMaxInputsHandler(cgiValues, user):
+
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    quotaName    = cgiValues['action_key']
+    newMaxInputs = int(cgiValues['action_value'])
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if not justin.stringIsSite(quotaName):
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  try:
+    justin.insertUpdate('UPDATE named_quotas SET max_files_per_workflow=%d '
+                        'WHERE quota_name="%s"' 
+                        % (newMaxInputs, quotaName))
+    justin.conn.commit()
+  except:
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def handlerQuotaMaxRunningJobs(cgiValues, user):
+
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    quotaName         = cgiValues['action_key']
+    newMaxRunningJobs = int(cgiValues['action_value'])
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if not justin.stringIsSite(quotaName) or newMaxRunningJobs < 0:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  try:
+    justin.insertUpdate('UPDATE named_quotas SET max_running_jobs=%d '
+                        'WHERE quota_name="%s"' 
+                        % (newMaxRunningJobs, quotaName))
+    justin.conn.commit()
+  except:
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def handlerQuotaWLCGGroup(cgiValues, user):
+
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    quotaName     = cgiValues['action_key']
+    wlcgGroupName = cgiValues['action_value']
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if not justin.stringIsSite(quotaName):
+    return ('400 Bad Request', 'Bad quota name')
+
+  groups = wlcgGroupsDict()
+  if wlcgGroupName not in groups:
+    return ('400 Bad Request', 'Bad WLCG group name')
+
+  try:
+    justin.insertUpdate('UPDATE named_quotas SET wlcg_group_id=%d '
+                        'WHERE quota_name="%s"' 
+                        % (groups[wlcgGroupName], quotaName))
+    justin.conn.commit()
+  except Exception as e:
+    print('Failed to update database: %s' % str(e))
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def handlerQuotaCondorGroup(cgiValues, user):
+
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    quotaName       = cgiValues['action_key']
+    condorGroupName = cgiValues['action_value']
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if not justin.stringIsSite(quotaName):
+    return ('400 Bad Request', 'Bad quota name')
+
+  groups = condorGroupsDict()
+  if condorGroupName not in groups:
+    return ('400 Bad Request', 'Bad HTCondor group name')
+
+  try:
+    justin.insertUpdate('UPDATE named_quotas SET condor_group_id=%d '
+                        'WHERE quota_name="%s"' 
+                        % (groups[condorGroupName], quotaName))
+    justin.conn.commit()
+  except Exception as e:
+    print('Failed to update database: %s' % str(e))
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def handlerScopeCondorGroup(cgiValues, user):
+
+# THIS SHOULD ACCEPT THE MEMBERS OF THE QUOTA, NOT JUST ADMINS!
+
+  if user['user_name'] not in justin.justinAdmins:
+    return ('403 Forbidden', 'You are not a justIN admin')
+
+  try:
+    scopeName       = cgiValues['action_key']
+    condorGroupName = cgiValues['action_value']
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if not justin.stringIsScope(scopeName):
+    return ('400 Bad Request', 'Bad scope name')
+
+  groups = condorGroupsDict()
+  if condorGroupName not in groups:
+    return ('400 Bad Request', 'Bad HTCondor group name')
+
+  try:
+    justin.insertUpdate('UPDATE scopes SET condor_group_id=%d '
+                        'WHERE scope_name="%s"' 
+                        % (groups[condorGroupName], scopeName))
+    justin.conn.commit()
+  except Exception as e:
+    print('Failed to update database: %s' % str(e))
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def handlerWorkflowCampaign(cgiValues, user):
+
+  try:
+    workflowID    = int(cgiValues['action_key'])
+    newCampaignID = int(cgiValues['action_value']) # 0 if to be created
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  try:
+     workflowRow = justin.select(
+           "SELECT quota_name,scopes.quota_id "
+           "FROM workflows "
+           "LEFT JOIN scopes ON scopes.scope_id=workflows.scope_id "
+           "LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id "
+           "WHERE workflow_id=%d " % workflowID,
+           justOne = True)
+  except:
+    return('500 Internal Server Error', 'Failed to get workflow information')
+
+  if (workflowRow['quota_name'] not in user['named_quotas']) and \
+     (user['user_name'] not in justin.justinAdmins):
+    return('403 Forbidden', 
+           'You need to be in quota %s to change this workflow' 
+           % workflowRow['quota_name'])
+
+  if newCampaignID == 0:
+    # Asking to create a new campaign just for this workflow
+    try:
+      newCampaignID = justin.insertUpdate('INSERT INTO campaigns SET '
+                                          'created=NOW(),'
+                                          'quota_id=%d,'
+                                          'user_id=%d'
+                                          % (workflowRow['quota_id'], 
+                                             user['user_id']))
+    except Exception as e:
+      return ('500 Internal Server Error', 
+              'Error creating new campaign for workflow: ' + str(e))
+  else:
+    # Check the requested campaign does already exist and is in the same quota
+    try:
+      campaignRow = justin.select("SELECT quota_id FROM campaigns "
+                                  "WHERE campaign_id=%d " % newCampaignID,
+                                  justOne = True)
+    except:
+      return('500 Internal Server Error', 'Failed to get campaign information')
+
+    if campaignRow is None or \
+       campaignRow['quota_id'] != workflowRow['quota_id']:
+      # This should never happen as we generated the HTML <select> values!
+      return('403 Forbidden', 'Workflow and campaign quota mismatch')
+
+  try:
+    justin.insertUpdate('UPDATE workflows SET campaign_id=%d '
+                        'WHERE workflow_id="%s"' 
+                        % (newCampaignID, workflowID))
+    justin.conn.commit()
+  except Exception as e:
+    return ('500 Internal Server Error', 'Failed to update database')    
+  else:
+    return ('302 Moved', '')
+
+def handlerWorkflowDescription(cgiValues, user):
+
+  try:
+    workflowID = int(cgiValues['action_key'])
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if user['user_name'] in justin.justinAdmins:
+    # OK
+    pass
+  else:
+    try:
+      workflowRow = justin.select(
+           "SELECT quota_name FROM workflows "
+           "LEFT JOIN scopes ON scopes.scope_id=workflows.scope_id "
+           "LEFT JOIN named_quotas ON named_quotas.quota_id=scopes.quota_id "
+           "WHERE workflow_id=%d " % workflowID,
+           justOne = True)
+    except:
+      return('500 Internal Server Error', 'Failed to get workflow information')
+
+    if workflowRow['quota_name'] not in users['quota_names']:
+      return ('403 Forbidden', 'You do not have access to that quota')
+
+  try:
+    justin.insertUpdate('UPDATE workflows SET description="%s" '
+                        'WHERE workflow_id="%d"' 
+       % (cgiValues['action_value'].replace('\\','\\\\').replace('"','\\"'),
+          workflowID))
+    justin.conn.commit()
+  except Exception as e:
+    print('Failed to update database: %s' % str(e))
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
+def handlerCampaignDescription(cgiValues, user):
+
+  try:
+    campaignID = int(cgiValues['action_key'])
+  except:
+    return ('400 Bad Request', 'Cannot parse values sent')
+
+  if user['user_name'] in justin.justinAdmins:
+    # OK
+    pass
+  else:
+    try:
+      campaignRow = justin.select(
+           "SELECT quota_name FROM campaigns "
+           "LEFT JOIN named_quotas ON named_quotas.quota_id=campaigns.quota_id "
+           "WHERE campaign_id=%d " % campaignID,
+           justOne = True)
+    except:
+      return('500 Internal Server Error', 'Failed to get campaign information')
+
+    if camapaignRow['quota_name'] not in users['quota_names']:
+      return ('403 Forbidden', 'You do not have access to that quota')
+
+  try:
+    justin.insertUpdate('UPDATE campaigns SET description="%s" '
+                        'WHERE campaign_id="%d"' 
+       % (cgiValues['action_value'].replace('\\','\\\\').replace('"','\\"'),
+          campaignID))
+    justin.conn.commit()
+  except Exception as e:
+    print('Failed to update database: %s' % str(e))
+    return ('500 Internal Server Error', 'Failed to update database')
+    
+  else:
+    return ('302 Moved', '')
+
 # Get POST data and then a big switch to direct it to the right handler
 def postHandlers(startResponse, environ, user):
 
@@ -3783,6 +6321,26 @@ def postHandlers(startResponse, environ, user):
   message    = ''
   nextURI    = '/'
   cgiValues  = {}
+
+  allActions = { 
+    'set_site_state'             : setSiteStateHandler,
+    'set_storage_read_state'     : setStorageStateHandler,
+    'set_storage_write_state'    : setStorageStateHandler,
+    'set_quota_processing_state' : setQuotaProcessingHandler,
+    'set_user_processing_state'  : setUserProcessingHandler,
+    'workflow_submit'            : setWorkflowStateHandler,
+    'workflow_restart'           : setWorkflowStateHandler,
+    'workflow_pause'             : setWorkflowStateHandler,
+    'workflow_finish'            : setWorkflowStateHandler,
+    'set_quota_max_inputs'       : setQuotaMaxInputsHandler,
+    'quota_max_running_jobs'     : handlerQuotaMaxRunningJobs,
+    'quota_wlcg_group'           : handlerQuotaWLCGGroup,
+    'quota_condor_group'         : handlerQuotaCondorGroup,
+    'scope_condor_group'         : handlerScopeCondorGroup,
+    'workflow_campaign'          : handlerWorkflowCampaign,
+    'workflow_description'       : handlerWorkflowDescription,
+    'campaign_description'       : handlerCampaignDescription
+               }
 
   if user is None:
     httpStatus = '403 Forbidden'
@@ -3809,18 +6367,14 @@ def postHandlers(startResponse, environ, user):
         httpStatus = '403 Forbidden'
         message    = 'Inconsistent session/code'
 
-      elif 'action_name' not in cgiValues:
+      elif 'action_name' not in cgiValues or \
+           cgiValues['action_name'] not in allActions:
         httpStatus = '400 Bad Request'
         message    = 'Malformed request'
 
-      elif cgiValues['action_name'] == 'set_site_state':
-        (httpStatus, message) = setSiteStateHandler(cgiValues, user)
-
-      elif cgiValues['action_name'] == 'set_storage_read_state':
-        (httpStatus, message) = setStorageStateHandler(cgiValues, user, 'read')
-
-      elif cgiValues['action_name'] == 'set_storage_write_state':
-        (httpStatus, message) = setStorageStateHandler(cgiValues, user, 'write')
+      else:
+        (httpStatus, message) = \
+            allActions[cgiValues['action_name']](cgiValues, user)
 
   if httpStatus is None:
     httpStatus = '400 Bad Request'
@@ -3852,6 +6406,9 @@ def application(environ, startResponse):
   justin.wsgiCallsCount += 1
   print('Call count (pid=%d): %d' % (os.getpid(), justin.wsgiCallsCount), 
         file=sys.stderr)
+
+  # Reload config
+  justin.readConf()
 
   try:
     # True should provoke a reconnection attempt.
@@ -3935,17 +6492,23 @@ def application(environ, startResponse):
   elif method == "authorized":
     output = authorizedPage(environ, user)
 
-  elif method == "list-jobscripts":
-    output = listJobscripts(environ, user, cgiValues, pageNumber, pageLength)
+  elif method == "list-campaigns":
+    output = listCampaigns(environ, user, cgiValues, pageNumber, pageLength)
 
-  elif method == "show-jobscript":
-    output = showJobscript(environ, user, cgiValues)
+  elif method == "show-campaign":
+    output = showCampaign(environ, user, cgiValues)
 
   elif method == "list-workflows":
     output = listWorkflows(environ, user, cgiValues, pageNumber, pageLength)
 
+  elif method == "list-archived-workflows":
+    output = listArchivedWorkflows(environ, user, cgiValues, 
+                                   pageNumber, pageLength)
   elif method == "show-workflow":
     output = showWorkflow(environ, user, cgiValues)
+
+  elif method == "show-archived-workflow":
+    output = showArchivedWorkflow(environ, user, cgiValues)
 
   elif method == "show-stage":
     output = showStage(environ, user, cgiValues)
@@ -3965,8 +6528,17 @@ def application(environ, startResponse):
   elif method == "list-scopes":
     output = listScopes(environ, user, cgiValues)
 
+  elif method == "list-quotas":
+    output = listQuotas(environ, user, cgiValues)
+
+  elif method == "show-quota":
+    output = showQuota(environ, user, cgiValues)
+
   elif method == "list-sites":
     output = listSites(environ, user, cgiValues)
+
+  elif method == "list-entries":
+    output = listEntries(environ, user, cgiValues)
 
   elif method == "list-storages":
     output = listStorages(environ, user, cgiValues)
@@ -3976,6 +6548,9 @@ def application(environ, startResponse):
 
   elif method == "show-site":
     output = showSite(environ, user, cgiValues)
+
+  elif method == "show-entry":
+    output = showEntry(environ, user, cgiValues)
 
   elif method == "show-storage":
     output = showStorage(environ, user, cgiValues)
@@ -4000,15 +6575,12 @@ def application(environ, startResponse):
 
   # Valid method was found, so return the string it output
 
-  if 'format' in cgiValues and cgiValues['format'] in ['csv','json']:
-    # Easier to just view in browser and then save with their preferred filename?
+  if output.startswith('/') or output.startswith('http'):
+    # The method wants a redirect
+    startResponseRedirect(startResponse, output)
+  elif 'format' in cgiValues and cgiValues['format'] in ['csv','json']:
+    # Easiest to view in browser and then save with their preferred filename?
     startResponseOK(startResponse, output, contentType = 'text/plain')
-#  if 'format' in cgiValues and cgiValues['format'] == 'csv':
-#    startResponseOK(startResponse, output, contentType = 'text/csv',
-#                    contentDisposition = 'attachment; filename="saved.csv"')
-#  elif 'format' in cgiValues and cgiValues['format'] == 'json':
-#    startResponseOK(startResponse, output, contentType = 'application/json',
-#                    contentDisposition = 'attachment; filename="saved.json"')
   else:
     startResponseOK(startResponse, output)
   return [output.encode('UTF-8')]

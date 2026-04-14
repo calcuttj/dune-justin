@@ -61,36 +61,25 @@ source ${add_config_line_source}
 
 #----------MAIN SCRIPT----------#
 
-export HAS_INNER_APPTAINER=False
-if [ -x /cvmfs/oasis.opensciencegrid.org/mis/apptainer/current/bin/apptainer ]
-then
-  /cvmfs/oasis.opensciencegrid.org/mis/apptainer/current/bin/apptainer \
-    shell --shell /usr/bin/true \
-  /cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-sl7:osg3.6  
-  if [ $? = 0 ] ; then
-    export HAS_INNER_APPTAINER=True
-  fi
-fi
-
 ( echo '==== justin-get-classads glidein_config ===='
   cat "${glidein_config}" 
   echo '==== justin-get-classads printenv ===='
   printenv ) > justin-get-classads-posted.txt
 
-for prodev in pro dev
+for instance in fnal ral dev int
 do
   http_code=`curl --silent --insecure \
     --data-binary @justin-get-classads-posted.txt \
-    --output justin-get-classads-$prodev.txt \
+    --output justin-get-classads-$instance.txt \
     --write-out "%{http_code}\n" \
     --connect-timeout 10 \
     --max-time 60 \
     --retry 5 \
-    https://justin-allocator-$prodev.dune.hep.ac.uk/api/get-classads \
+    https://justin-allocator-$instance.dune.hep.ac.uk/api/get-classads \
     2>/dev/null`
 
-  if [ "$http_code" = 200 -a -r justin-get-classads-$prodev.txt ] ; then
-    cat justin-get-classads-$prodev.txt | (
+  if [ "$http_code" = 200 -a -r justin-get-classads-$instance.txt ] ; then
+    cat justin-get-classads-$instance.txt | (
       while read line
       do
         advertise $line C
